@@ -1,0 +1,67 @@
+name: Publish to npm + GitHub Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write
+  # contents: write is required to create the GitHub Release for the tag
+  # (gh release create); provenance signing still needs id-token: write.
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the "tag commit is on main" verification below
+          # (git merge-base) has the ancestry it needs.
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm run typecheck
+      - name: Test
+        run: pnpm test
+      - name: Build
+        run: pnpm run build
+      - name: Verify version matches the tag
+        run: |
+          TAG="${{ github.ref_name }}"
+          VER="v$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag $TAG does not match package version $VER"
+            exit 1
+          fi
+      - name: Verify tag commit is on main
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${{ github.ref_name }} points to a commit not on main; merge the code first, then re-tag on main"
+            exit 1
+          fi
+      # Trusted publishing (OIDC) — no long-lived NODE_AUTH_TOKEN required;
+      # npm >= 11.5.1 exchanges the Actions OIDC token for a short-lived
+      # publish credential and attaches provenance automatically.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+      # Create the GitHub Release for the tag after a successful npm publish,
+      # so a failed publish never leaves an orphaned release. Notes are
+      # generated natively by GitHub and grouped by PR labels per
+      # .github/release.yml; auto-label.yml maps the (convention-enforced) PR
+      # title prefix to a label, so every merged PR lands in a category.
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes

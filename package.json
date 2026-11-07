@@ -1,0 +1,86 @@
+{
+  "name": "dsh-continual-harness",
+  "version": "0.3.3",
+  "packageManager": "pnpm@11.21.0",
+  "description": "Standalone DeepSeek Harness plugin: continual harness self-evolution. The agent persists and refines reusable prompt notes, memories, skill contracts, and subagent specs through small evidence-backed edits, with automatic refinement gates, rollback, and prompt injection.",
+  "keywords": [
+    "deepseek-harness",
+    "plugin",
+    "self-improvement",
+    "continual-harness",
+    "agent"
+  ],
+  "type": "module",
+  "main": "lib/types/index.js",
+  "types": "lib/types/index.d.ts",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/types/index.js"
+    },
+    "./invariant": {
+      "types": "./lib/types/invariant.d.ts",
+      "default": "./lib/types/invariant.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "lib/types/**/*",
+    "scripts/backfill-project-tags.mjs",
+    "scripts/repair-harness-state-logs.mjs"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jasen215/dsh-continual-harness.git"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-home-paths": "0.2.0-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": ">=0.1.5-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-llm": ">=0.1.5-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-session": ">=0.1.5-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-system-prompt": ">=0.1.5-rc.1 <0.2.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.5-rc.1 <0.2.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4",
+    "@deepseek-ai/cosmokit": "1.8.3",
+    "@deepseek-ai/dsh-agent": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-invariants": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-scope": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "@types/node": "^22.20.0",
+    "@vitest/coverage-v8": "^4.1.10",
+    "oxlint": "^1.80.0",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "oxlint src tests scripts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "tsx scripts/verify-baseline.mts",
+    "verify:accept": "tsx scripts/verify-baseline.mts --accept"
+  }
+}

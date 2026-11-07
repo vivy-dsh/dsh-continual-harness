@@ -1,0 +1,1102 @@
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { AgentRegistry, agentEvents } from '@deepseek-ai/dsh-agent'
+import { stubInbox } from './fake-inbox.ts'
+import type { Agent, AgentStatus } from '@deepseek-ai/dsh-agent'
+import { ToolCallId, createUserMessage } from '@deepseek-ai/dsh-llm'
+import type { MessageSource } from '@deepseek-ai/dsh-llm'
+import { Session, SessionId, KNOWN_SESSION_EVENT_TYPES } from '@deepseek-ai/dsh-session'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
+import type { ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import * as plugin from '../src/index.ts'
+import { loadReviews } from '../src/audit.ts'
+import { HARNESS_REFINEMENT_EVENT, isHarnessStateSource } from '../src/domain.ts'
+import { PLUGIN_LOG_FILE_NAME } from '../src/logfile.ts'
+import { HarnessStore } from '../src/store.ts'
+
+const testToolSignal = new AbortController().signal
+const tempDirs: string[] = []
+
+function tempHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'harness-plugin-'))
+  tempDirs.push(dir)
+  return dir
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
+
+interface StubAgent {
+  readonly agent: Agent
+  readonly session: Session
+}
+
+/** Build one registry-compatible live agent whose injections enter the durable inbox. */
+function stubAgent(rawId: string): StubAgent {
+  const session = Session.create(SessionId(rawId))
+  let status: AgentStatus = 'running'
+  const agent: Agent = {
+    id: session.id,
+    options: { provider: 'test-provider', model: 'test-model' },
+    session,
+    inbox: stubInbox(),
+    get status() { return status },
+    ctx: new Context(),
+    send: () => {},
+    followup: () => {},
+    steer: () => ({ outcome: Promise.resolve({ status: 'rejected' as const }) }),
+    inject(input) {
+      this.inbox.append('next-step', input)
+    },
+    cancel() {},
+    runMaintenance: task => task(new AbortController().signal),
+    whenIdle() { return Promise.resolve() },
+  }
+  return { agent, session }
+}
+
+/** Execute one registered tool. */
+async function execute(
+  ctx: Context,
+  name: string,
+  args: unknown,
+  agent: Agent,
+): Promise<ToolExecutionResult> {
+  return ctx.tools.execute({
+    signal: testToolSignal,
+    callId: ToolCallId(`call-${Math.random()}`),
+    name,
+    arguments: args,
+    agent,
+  })
+}
+
+/** Parse the compact JSON returned by a successful tool call. */
+function resultJson(result: ToolExecutionResult): Record<string, unknown> {
+  expect(result.isError).toBe(false)
+  if (result.isError) throw new Error('expected tool success')
+  const block = result.content[0]
+  if (block?.type !== 'text') throw new Error('expected text tool result')
+  return JSON.parse(block.text) as Record<string, unknown>
+}
+
+/** Hermetic plugin config: harness root + skills dir inside one temp home. */
+function pluginConfig(root: string) {
+  return { defaultGlobal: true, harnessRoot: root, skillsDir: join(root, 'skills') }
+}
+
+/** Llm stand-in that yields one plan JSON per planning call. */
+function makePlanLlm(plan: Record<string, unknown>) {
+  let calls = 0
+  return {
+    get callCount() { return calls },
+    async *stream() {
+      calls += 1
+      yield { type: 'text-delta' as const, text: JSON.stringify(plan) }
+      yield { type: 'finish' as const, reason: { kind: 'success' as const } }
+    },
+  }
+}
+
+/** Llm stand-in that yields one reply JSON per completion call, in order. */
+function makeLlm(replies: ReadonlyArray<Record<string, unknown>>) {
+  let calls = 0
+  return {
+    get callCount() { return calls },
+    async *stream() {
+      const reply = replies[Math.min(calls, replies.length - 1)]
+      calls += 1
+      yield { type: 'text-delta' as const, text: JSON.stringify(reply) }
+      yield { type: 'finish' as const, reason: { kind: 'success' as const } }
+    },
+  }
+}
+
+/** A valid global skill-create plan the fake llm returns. */
+const PLAN = {
+  id: 'refine_appr',
+  summary: 'approve the global write',
+  edits: [{ action: 'create', kind: 'skill', id: 'm1', blastRadius: 'project', content: 'learned', description: 'Use when a durable fact is worth keeping' }],
+}
+
+describe('plugin registration', () => {
+  it('mounts the plugin and registers the harness_refine tool', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(tempHome()))
+    expect(ctx.tools.get('harness_refine')?.name).toBe('harness_refine')
+  })
+
+  it('registers harness/refinement in the known session event types for legacy log reads', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(tempHome()))
+    // The persistence read path refuses a log whose event type is outside the
+    // known set unless the event is marked ignorable. Older plugin builds
+    // wrote harness/refinement without the marker, so mounting the plugin
+    // must register the type to keep those historical logs readable.
+    expect((KNOWN_SESSION_EVENT_TYPES as Set<string>).has(HARNESS_REFINEMENT_EVENT)).toBe(true)
+  })
+
+  it('registers harness_wrapup by default and skips it when wrapupEnabled is false', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(tempHome()))
+    expect(ctx.tools.get('harness_wrapup')?.name).toBe('harness_wrapup')
+
+    const off = new Context()
+    await off.plugin(SystemPrompt)
+    await off.plugin(AgentRegistry)
+    await off.plugin(ToolRuntime)
+    await off.plugin(plugin, { ...pluginConfig(tempHome()), wrapupEnabled: false })
+    expect(off.tools.get('harness_wrapup')).toBeUndefined()
+  })
+
+  it('accepts maxInjectedEntriesPerKind and validates it as a positive integer', async () => {
+    const ok = new Context()
+    await ok.plugin(SystemPrompt)
+    await ok.plugin(AgentRegistry)
+    await ok.plugin(ToolRuntime)
+    await ok.plugin(plugin, { ...pluginConfig(tempHome()), maxInjectedEntriesPerKind: 3 })
+    expect(ok.tools.get('harness_refine')).toBeDefined()
+
+    const bad = new Context()
+    await bad.plugin(SystemPrompt)
+    await bad.plugin(AgentRegistry)
+    await bad.plugin(ToolRuntime)
+    await expect(
+      bad.plugin(plugin, { ...pluginConfig(tempHome()), maxInjectedEntriesPerKind: 1.5 }),
+    ).rejects.toThrow()
+  })
+
+  it('accepts custom skill bundle limits and rejects non-positive values', async () => {
+    const ok = new Context()
+    await ok.plugin(SystemPrompt)
+    await ok.plugin(AgentRegistry)
+    await ok.plugin(ToolRuntime)
+    await ok.plugin(plugin, {
+      ...pluginConfig(tempHome()),
+      maxSkillFiles: 5,
+      maxSkillFileBytes: 128 * 1024,
+      maxSkillBundleBytes: 512 * 1024,
+    })
+    expect(ok.tools.get('harness_refine')).toBeDefined()
+
+    const bad = new Context()
+    await bad.plugin(SystemPrompt)
+    await bad.plugin(AgentRegistry)
+    await bad.plugin(ToolRuntime)
+    await expect(
+      bad.plugin(plugin, { ...pluginConfig(tempHome()), maxSkillFiles: 0 }),
+    ).rejects.toThrow()
+  })
+
+  it('rolls back a prior global refinement through the tool without an LLM', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(stubAgent('seeder').agent, {
+      id: 'refine_seed',
+      summary: 'seed a global memory',
+      edits: [{ action: 'create', kind: 'memory', id: 'seed', blastRadius: 'project', content: 'x' }],
+    }, { global: true })
+
+    const result = await execute(ctx, 'harness_refine', { rollback_id: 'refine_seed' }, stubAgent('executor').agent)
+    const json = resultJson(result)
+    expect(json.refinement_id).toBe('rollback_refine_seed')
+    expect(json.scope).toBe('global')
+    expect(json.applied).toBe(1)
+
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.globalState().entries.memory['seed']).toBeUndefined()
+  })
+})
+
+describe('governance default mode', () => {
+  it('performs a global write without consulting the approval service', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm(PLAN) as never)
+
+    const stub = { ask: vi.fn(async () => ({ value: 'approve' })) }
+    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('default-mode').agent)
+    const json = resultJson(result)
+    expect(json.refinement_id).toBe('refine_appr')
+    expect(json.applied).toBe(1)
+    expect(stub.ask).not.toHaveBeenCalled()
+
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.globalState().entries.skill['m1']?.content).toBe('learned')
+  })
+
+  it('leaves automatic refinement to the orchestrator: a turn threshold records nothing and disposes nothing', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    const llm = makeLlm([])
+    ctx.provide('llm', llm as never)
+    await ctx.plugin(plugin, {
+      ...pluginConfig(home),
+      protectedKinds: [],
+      autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 1, compact: true },
+    })
+    const { agent } = stubAgent('orchestrator-owned')
+    ctx.agents.register(agent)
+    await Promise.resolve()
+    for (const seq of [1, 2]) {
+      ctx.emit('session/event', agent.session, {
+        type: 'turn/end', seq, time: Date.now(), data: { turn: seq, reason: { kind: 'success' } },
+      })
+    }
+    ctx.emit('session/disposed', agent.session)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(llm.callCount).toBe(0)
+    expect(loadReviews(home)).toEqual([])
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.localState(agent).entries.skill['m1']).toBeUndefined()
+  })
+})
+
+describe('governance conservative mode', () => {
+  it('blocks a global write the user rejects', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm(PLAN) as never)
+
+    const stub = { ask: vi.fn(async () => ({ value: 'reject' })) }
+    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
+    await ctx.plugin(plugin, { ...pluginConfig(home), requireGlobalApproval: true })
+
+    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('reject-mode').agent)
+    const json = resultJson(result)
+    expect(json.refinement_id).toBe('none')
+    expect(json.scope).toBe('global')
+    expect(json.summary).toContain('not approved')
+    expect(json.applied).toBe(0)
+    expect(stub.ask).toHaveBeenCalledOnce()
+
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.globalState().entries.skill['m1']).toBeUndefined()
+  })
+
+  it('allows a global write the user approves', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm(PLAN) as never)
+
+    const stub = { ask: vi.fn(async () => ({ value: 'approve' })) }
+    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
+    await ctx.plugin(plugin, { ...pluginConfig(home), requireGlobalApproval: true })
+
+    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('approve-mode').agent)
+    const json = resultJson(result)
+    expect(json.refinement_id).toBe('refine_appr')
+    expect(json.applied).toBe(1)
+    expect(stub.ask).toHaveBeenCalledOnce()
+
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.globalState().entries.skill['m1']?.content).toBe('learned')
+  })
+})
+
+describe('governance config defaults', () => {
+  it('wires the default file log into the harness root with mode 0600', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    // logToFile defaults to true: the exporter attached during apply lazily
+    // materializes <harnessRoot>/continual-harness.log on the first harness log.
+    ctx.logger('harness').info('mount probe')
+
+    const file = join(home, PLUGIN_LOG_FILE_NAME)
+    expect(existsSync(file)).toBe(true)
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  it('does not create the file log when logToFile is disabled', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, { ...pluginConfig(home), logToFile: false })
+
+    ctx.logger('harness').info('not persisted')
+
+    expect(existsSync(join(home, PLUGIN_LOG_FILE_NAME))).toBe(false)
+  })
+
+  it('enforces the default maxEntryGrowth cap on a global update through the tool', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+
+    // Seed a one-character global skill entry through the shared store file.
+    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(stubAgent('growth-seeder').agent, {
+      id: 'refine_seed_growth',
+      summary: 'seed a one-character skill',
+      edits: [{ action: 'create', kind: 'skill', id: 'seed', blastRadius: 'project', content: 'x' }],
+    }, { global: true })
+
+    // The plan carries a reason so validation passes and only the growth rule
+    // fires: 20 chars vs 1 is a 19x growth, far beyond the default 0.5 cap.
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_growth',
+      summary: 'grow the seeded entry',
+      edits: [{ action: 'update', kind: 'skill', id: 'seed', blastRadius: 'project', content: 'a'.repeat(20), reason: 'grow it' }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const result = await execute(ctx, 'harness_refine', {}, stubAgent('growth-executor').agent)
+    const json = resultJson(result)
+    expect(json.applied).toBe(0)
+    expect(json.failed).toBe(1)
+    const edit = (json.edits as Array<Record<string, unknown>>)[0]
+    expect(edit).toMatchObject({ action: 'update', kind: 'skill', id: 'seed', blastRadius: 'project', applied: false })
+    expect(edit?.error).toBe('entry growth exceeds the maxEntryGrowth cap')
+
+    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(fresh.globalState().entries.skill['seed']?.content).toBe('x')
+  })
+})
+
+describe('optional refine command capability', () => {
+  it('mounts without a commands capability, keeps the normal tools, and warns once', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    const warns: string[] = []
+    ctx.logger.exporter({
+      levels: { default: 3 },
+      export(message) {
+        if (message.type === 'warn') warns.push(message.name)
+      },
+    })
+    await ctx.plugin(plugin, pluginConfig(tempHome()))
+    expect(ctx.tools.get('harness_refine')?.name).toBe('harness_refine')
+    expect(ctx.tools.get('harness_wrapup')?.name).toBe('harness_wrapup')
+    expect(ctx.tools.get('harness_benchmark')?.name).toBe('harness_benchmark')
+    expect(warns.filter(name => name === 'harness')).toHaveLength(1)
+  })
+
+  it('registers the refine command through a commands capability and unregisters it on unload', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    const dispose = vi.fn()
+    const register = vi.fn(() => dispose)
+    ctx.provide('commands', { register })
+    const fiber = await ctx.plugin(plugin, pluginConfig(tempHome()))
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'refine', handler: expect.any(Function) }))
+    await fiber.dispose()
+    expect(dispose).toHaveBeenCalled()
+  })
+})
+
+describe('benchmark tool registration', () => {
+  it('registers the harness_benchmark tool by default and skips it when disabled', async () => {
+    const on = new Context()
+    await on.plugin(SystemPrompt)
+    await on.plugin(AgentRegistry)
+    await on.plugin(ToolRuntime)
+    await on.plugin(plugin, pluginConfig(tempHome()))
+    expect(on.tools.get('harness_benchmark')?.name).toBe('harness_benchmark')
+
+    const off = new Context()
+    await off.plugin(SystemPrompt)
+    await off.plugin(AgentRegistry)
+    await off.plugin(ToolRuntime)
+    await off.plugin(plugin, { ...pluginConfig(tempHome()), benchmark: { enabled: false } })
+    expect(off.tools.get('harness_benchmark')).toBeUndefined()
+  })
+
+  it('accepts explicit benchmark config and still registers the tool', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, {
+      ...pluginConfig(tempHome()),
+      benchmark: { enabled: true, defaultRuns: 2, maxRuns: 5, passThreshold: 70, regressionTolerance: 5, maxFailedCells: 1 },
+    })
+    expect(ctx.tools.get('harness_benchmark')?.name).toBe('harness_benchmark')
+  })
+
+  it('keeps the existing tools registered when the benchmark tool is on', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(tempHome()))
+    expect(ctx.tools.get('harness_refine')?.name).toBe('harness_refine')
+    expect(ctx.tools.get('harness_wrapup')?.name).toBe('harness_wrapup')
+    expect(ctx.tools.get('harness_benchmark')?.name).toBe('harness_benchmark')
+  })
+})
+
+describe('harness-state projection', () => {
+  it('injects the overview when the digest changes and skips when it does not', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const { agent } = stubAgent('projected')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(agent, {
+      id: 'refine_p',
+      summary: 'seed',
+      edits: [{ action: 'create', kind: 'memory', id: 'fact', blastRadius: 'project', content: 'durable' }],
+    }, {})
+
+    const signal = new AbortController().signal
+    const claimed = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'prompt' }] })]
+
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed }),
+    )
+    expect(first.kind).toBe('enter')
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstHarness = first.messages.filter(message => isHarnessStateSource(message.source))
+    expect(firstHarness).toHaveLength(1)
+    expect(firstHarness[0].content).toContainEqual(expect.objectContaining({ type: 'text' }))
+    // dsh 0.1.7 removed the shared catch-all `plugin` source kind: the plugin
+    // now declares its own producer kind on MessageSourceMap (see domain.ts),
+    // named after the V3→V4 migration's own `plugin:<package>` convention so a
+    // migrated block and a freshly written one share the kind. The
+    // `instructions` form still marks exactly the state overview.
+    expect(firstHarness[0].source).toEqual({ kind: 'plugin:dsh-continual-harness', form: 'instructions' })
+
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed, turn: 1, step: 2, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed }),
+    )
+    if (second.kind !== 'enter') throw new Error('expected enter decision')
+    const secondHarness = second.messages.filter(message => isHarnessStateSource(message.source))
+    expect(secondHarness).toHaveLength(0)
+  })
+
+  it('replaces the previous harness-state block on digest change instead of accumulating', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const { agent, session } = stubAgent('projected-replace')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(agent, {
+      id: 'refine_p1',
+      summary: 'seed one',
+      edits: [{ action: 'create', kind: 'memory', id: 'fact', blastRadius: 'project', content: 'durable' }],
+    }, {})
+    const signal = new AbortController().signal
+    const claimed1 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'prompt one' }] })]
+
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed1, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed1 }),
+    )
+    expect(first.kind).toBe('enter')
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstBlock = first.messages.find(message => isHarnessStateSource(message.source))
+    expect(firstBlock).toBeDefined()
+
+    // The agent loop commits every decision message to the session log.
+    for (const message of first.messages) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+    }
+
+    // State changes -> digest changes -> the next pre-step must replace, not add.
+    seeder.applyRefinement(agent, {
+      id: 'refine_p2',
+      summary: 'seed two',
+      edits: [{ action: 'create', kind: 'memory', id: 'fact2', blastRadius: 'project', content: 'more' }],
+    }, {})
+    const claimed2 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'prompt two' }] })]
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed2, turn: 1, step: 2, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed2 }),
+    )
+    if (second.kind !== 'enter') throw new Error('expected enter decision')
+    // The replacement is committed directly to the session; the decision carries no block.
+    expect(second.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+
+    // Exactly one harness-state block remains on the surface, with the new digest.
+    const derived = session.deriveMessages()
+    const blocks = derived.filter(message => isHarnessStateSource(message.source))
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]?.content).not.toEqual(firstBlock?.content)
+  })
+
+  it('skips re-injection when a follow-up message carries no evidence', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, { ...pluginConfig(home), maxInjectedEntriesPerKind: 1 })
+
+    const { agent, session } = stubAgent('gated-no-evidence')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    // The evidence entry is created first and sorts last, so both the recency
+    // order and the id tiebreak point at the filler: the follow-up query below
+    // is guaranteed to select a different entry than the topical one did.
+    seeder.applyRefinement(agent, {
+      id: 'refine_gate_1',
+      summary: 'seed evidence',
+      edits: [{ action: 'create', kind: 'skill', id: 'zzz-late', blastRadius: 'project', content: 'zzzalpha ranking notes' }],
+    }, {})
+    seeder.applyRefinement(agent, {
+      id: 'refine_gate_2',
+      summary: 'seed filler',
+      edits: [{ action: 'create', kind: 'skill', id: 'a-pad', blastRadius: 'project', content: 'unrelated filler' }],
+    }, {})
+
+    const signal = new AbortController().signal
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzalpha ranking' }] }), { surfaceOp: 'append' })
+    const claimed1 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzalpha ranking' }] })]
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed1, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed1 }),
+    )
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstBlock = first.messages.find(message => isHarnessStateSource(message.source))
+    expect(firstBlock).toBeDefined()
+    for (const message of first.messages) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+    }
+
+    // "1" tokenizes to nothing: the selection collapses to recency, so the
+    // overview text changes while carrying no evidence for the question asked.
+    // Replacing a topical block with that would trade relevant experience for
+    // the newest entries, so the block must survive untouched.
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '1' }] }), { surfaceOp: 'append' })
+    const claimed2 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '1' }] })]
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed2, turn: 2, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed2 }),
+    )
+    expect(second.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+    const blocks = session.deriveMessages().filter(message => isHarnessStateSource(message.source))
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]?.content).toEqual(firstBlock?.content)
+  })
+
+  it('re-injects when the question surfaces an evidence-backed entry the block lacks', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, { ...pluginConfig(home), maxInjectedEntriesPerKind: 1, injectionAnchor: 'query' })
+
+    const { agent, session } = stubAgent('gated-topic-switch')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(agent, {
+      id: 'refine_switch_1',
+      summary: 'seed alpha',
+      edits: [{ action: 'create', kind: 'skill', id: 'zzz-alpha', blastRadius: 'project', content: 'zzzalpha ranking notes' }],
+    }, {})
+    seeder.applyRefinement(agent, {
+      id: 'refine_switch_2',
+      summary: 'seed beta',
+      edits: [{ action: 'create', kind: 'skill', id: 'zzz-beta', blastRadius: 'project', content: 'zzzbeta caching notes' }],
+    }, {})
+
+    const signal = new AbortController().signal
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzalpha ranking' }] }), { surfaceOp: 'append' })
+    const claimed1 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzalpha ranking' }] })]
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed1, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed1 }),
+    )
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstBlock = first.messages.find(message => isHarnessStateSource(message.source))
+    expect(firstBlock?.content).toContainEqual(expect.objectContaining({ text: expect.stringContaining('zzz-alpha') }))
+    for (const message of first.messages) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+    }
+
+    // A new question with real evidence must refresh the block, even though no
+    // refinement landed in between.
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzbeta caching' }] }), { surfaceOp: 'append' })
+    const claimed2 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'zzzbeta caching' }] })]
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed2, turn: 2, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed2 }),
+    )
+    expect(second.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+    const blocks = session.deriveMessages().filter(message => isHarnessStateSource(message.source))
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]?.content).not.toEqual(firstBlock?.content)
+    expect(blocks[0]?.content).toContainEqual(expect.objectContaining({ text: expect.stringContaining('zzz-beta') }))
+  })
+
+  it('keeps one block across a topic change when injectionAnchor is stable', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, { ...pluginConfig(home), injectionAnchor: 'stable' })
+
+    const { agent, session } = stubAgent('gated-stable-anchor')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    // 16 entries against an index cap of 15: the address of a slot in the index
+    // is decided by the anchor, and one entry does not fit. That is what makes
+    // this test able to fail — with a live-question anchor the second question
+    // brings its own entry into the index.
+    seeder.applyRefinement(agent, {
+      id: 'refine_stable_seed',
+      summary: 'seed',
+      edits: [
+        { action: 'create', kind: 'skill', id: 'zzz-beta', blastRadius: 'project', content: 'zzzbeta caching notes' },
+        { action: 'create', kind: 'skill', id: 'zzz-alpha', blastRadius: 'project', content: 'zzzalpha ranking notes' },
+        ...Array.from({ length: 14 }, (_, index) => ({
+          action: 'create' as const,
+          kind: 'skill' as const,
+          id: `pad-${String(index).padStart(2, '0')}`,
+          blastRadius: 'project' as const,
+          content: 'unrelated filler',
+        })),
+      ],
+    }, {})
+
+    const signal = new AbortController().signal
+    const opening = 'zzzalpha ranking'
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: opening }] }), { surfaceOp: 'append' })
+    const claimed1 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: opening }] })]
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed1, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed1 }),
+    )
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstBlock = first.messages.find(message => isHarnessStateSource(message.source))
+    expect(firstBlock).toBeDefined()
+    expect(JSON.stringify(firstBlock?.content)).toContain('zzz-alpha')
+    for (const message of first.messages) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+    }
+
+    // A new question with its own evidence must NOT move a session-stable block:
+    // the anchor is the opening request plus the project, so the block stays
+    // byte-identical and the provider's cached prefix survives.
+    const followUp = 'zzzbeta caching'
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: followUp }] }), { surfaceOp: 'append' })
+    const claimed2 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: followUp }] })]
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed2, turn: 2, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed2 }),
+    )
+    expect(second.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+    const blocks = session.deriveMessages().filter(message => isHarnessStateSource(message.source))
+    expect(blocks).toHaveLength(1)
+    expect(blocks[0]?.content).toEqual(firstBlock?.content)
+  })
+
+  it('re-publishes under a stable anchor when the harness state changes', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, { ...pluginConfig(home), injectionAnchor: 'stable' })
+
+    const { agent, session } = stubAgent('gated-stable-refinement')
+    const store = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    store.applyRefinement(agent, {
+      id: 'refine_stable_before',
+      summary: 'before',
+      edits: [{ action: 'create', kind: 'memory', id: 'existing', blastRadius: 'project', content: 'already known' }],
+    }, {})
+
+    const signal = new AbortController().signal
+    const opening = 'existing memory'
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: opening }] }), { surfaceOp: 'append' })
+    const claimed1 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: opening }] })]
+    const first = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed1, turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed1 }),
+    )
+    if (first.kind !== 'enter') throw new Error('expected enter decision')
+    const firstBlock = first.messages.find(message => isHarnessStateSource(message.source))
+    expect(firstBlock).toBeDefined()
+    for (const message of first.messages) {
+      session.append('user/message', message, { surfaceOp: 'append' })
+    }
+
+    // A stable anchor must not freeze the block: learning something mid-session
+    // is precisely when the model needs the new entry, and the gate's refinement
+    // stamp changes independently of the anchor. Suppressing this would buy a
+    // surviving cache prefix with a session that never sees what it learned.
+    store.applyRefinement(agent, {
+      id: 'refine_stable_after',
+      summary: 'learned mid-session',
+      edits: [{ action: 'create', kind: 'memory', id: 'fresh', blastRadius: 'project', content: 'mid-session learning' }],
+    }, {})
+
+    const followUp = 'an unrelated question'
+    session.append('user/message', createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: followUp }] }), { surfaceOp: 'append' })
+    const claimed2 = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: followUp }] })]
+    const second = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed2, turn: 2, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed2 }),
+    )
+    // The block is shadowed in place and appended to the session log, so the
+    // fresh snapshot reaches this step's derived transcript without re-entering
+    // the decision messages — the block count stays at one rather than doubling.
+    expect(second.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+    const blocks = session.deriveMessages().filter(message => isHarnessStateSource(message.source))
+    expect(blocks).toHaveLength(1)
+    expect(JSON.stringify(blocks[0]?.content)).toContain('learned mid-session')
+    expect(blocks[0]?.content).not.toEqual(firstBlock?.content)
+  })
+
+  it('publishes on the next step when the first step was vacuous', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const { agent } = stubAgent('gated-vacuous-first-step')
+    const seeder = new HarnessStore(ctx, { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(agent, {
+      id: 'refine_vacuous',
+      summary: 'seed',
+      edits: [{ action: 'create', kind: 'memory', id: 'fact', blastRadius: 'project', content: 'durable' }],
+    }, {})
+
+    const signal = new AbortController().signal
+    // A vacuous first step shows nothing, so the block is not recorded as
+    // injected: recording it would suppress the block for the rest of the
+    // session, because a later step renders the same state and thus the same
+    // digest.
+    const vacuous = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: [], turn: 1, step: 1, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: [] }),
+    )
+    expect(vacuous.messages.some(message => isHarnessStateSource(message.source))).toBe(false)
+
+    const claimed = [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'prompt' }] })]
+    const next = await agentEvents(ctx, agent).waterfall(
+      'agent/pre-step',
+      { messages: claimed, turn: 1, step: 2, signal },
+      () => Promise.resolve({ kind: 'enter' as const, messages: claimed }),
+    )
+    if (next.kind !== 'enter') throw new Error('expected enter decision')
+    expect(next.messages.some(message => isHarnessStateSource(message.source))).toBe(true)
+  })
+})
+
+describe('isHarnessStateSource across the source-kind migration', () => {
+  // Legacy shapes are outside the 0.1.7 MessageSource union by construction:
+  // they are read from logs written by older builds, so they need casts.
+  const sourceOf = (value: Record<string, unknown>): MessageSource => value as unknown as MessageSource
+
+  it('recognizes the injected overview in every kind the plugin has written', () => {
+    // This build's declared producer kind, which is also what the released
+    // V3→V4 migration rewrites the old `plugin` wrapper into.
+    expect(isHarnessStateSource(sourceOf({ kind: 'plugin:dsh-continual-harness', form: 'instructions' }))).toBe(true)
+    // A V3 log read without migration still carries the retired shared wrapper.
+    expect(isHarnessStateSource(sourceOf({
+      kind: 'plugin', plugin: 'dsh-continual-harness', form: 'instructions',
+    }))).toBe(true)
+    // The custom kind written by builds up to 0.3.0.
+    expect(isHarnessStateSource(sourceOf({ kind: 'harness-state' }))).toBe(true)
+  })
+
+  it('leaves another message from the same producer alone', () => {
+    // A /refine outcome notice shares the producer kind. Claiming it would make
+    // the projection replace a command reply instead of its own state block.
+    expect(isHarnessStateSource(sourceOf({
+      kind: 'plugin:dsh-continual-harness', form: 'notice', summary: 'committed',
+    }))).toBe(false)
+    // Another producer's wrapper with our plugin name is still not ours.
+    expect(isHarnessStateSource(sourceOf({ kind: 'plugin', plugin: 'other-plugin', form: 'instructions' }))).toBe(false)
+  })
+})
+
+describe('skill bundle acceptance', () => {
+  it('restores and clears bundle files on rollback of a create', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_bundle',
+      summary: 'create a bundle skill',
+      edits: [{
+        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
+        description: 'Use whenever bundling',
+        content: '## Steps\n1. Run `scripts/bundle.py`',
+        files: { 'scripts/bundle.py': 'print(1)' },
+      }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const created = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent))
+    expect(created.applied).toBe(1)
+    expect(existsSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'))).toBe(true)
+    expect(readFileSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'), 'utf8')).toBe('print(1)')
+    const skillMd = readFileSync(join(home, 'skills', 'bundle-demo', 'SKILL.md'), 'utf8')
+    expect(skillMd).toContain('dsh-continual-harness')
+    expect(skillMd).toContain('esp')
+
+    // roll back the create without an LLM
+    const rolled = resultJson(await execute(ctx, 'harness_refine', { rollback_id: 'refine_bundle' }, stubAgent('executor').agent))
+    expect(rolled.applied).toBe(1)
+    expect(existsSync(join(home, 'skills', 'bundle-demo'))).toBe(false)
+  })
+
+  it('never touches a non-harness-owned bundle during create', async () => {
+    const home = tempHome()
+    mkdirSync(join(home, 'skills', 'mine'), { recursive: true })
+    writeFileSync(join(home, 'skills', 'mine', 'SKILL.md'), '---\nname: mine\n---\nuser skill')
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_take',
+      summary: 'try to take a user name',
+      edits: [{ action: 'create', kind: 'skill', id: 'mine', blastRadius: 'project', content: 'body' }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const result = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent))
+    expect(result.failed).toBe(1)
+    const edit = (result.edits as Array<Record<string, unknown>>).find(entry => entry.id === 'mine')
+    expect(String(edit?.error)).toContain('not harness-owned')
+    expect(readFileSync(join(home, 'skills', 'mine', 'SKILL.md'), 'utf8')).toBe('---\nname: mine\n---\nuser skill')
+  })
+})
+
+describe('post-apply diagnostics wiring', () => {
+  it('attaches a completed diagnostics report to tool output by default', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm(PLAN) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-on').agent))
+    expect(json).toMatchObject({ applied: 1, failed: 0, refinement_id: 'refine_appr' })
+    expect(json.diagnostics).toMatchObject({ status: 'completed', structural: [], security: [], errors: [] })
+  })
+
+  it('omits diagnostics entirely when diagnosticsEnabled is false', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm(PLAN) as never)
+    await ctx.plugin(plugin, { ...pluginConfig(home), diagnosticsEnabled: false })
+
+    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-off').agent))
+    expect(json.applied).toBe(1)
+    expect(json.diagnostics).toBeUndefined()
+  })
+
+  it('reports security issues from the local provider when securityEnabled is true', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_secret',
+      summary: 'create a skill with a secret',
+      edits: [{
+        action: 'create', kind: 'skill', id: 'secret-demo', blastRadius: 'project',
+        description: 'Use whenever handling tokens',
+        content: '## Steps\n1. Call the API with ' + ('sk-' + 'abcdef1234567890abcdef1234567890'),
+      }],
+    }) as never)
+    await ctx.plugin(plugin, { ...pluginConfig(home), securityEnabled: true })
+
+    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-sec').agent))
+    expect(json.applied).toBe(1)
+    const diagnostics = json.diagnostics as { status: string; security: Array<Record<string, unknown>> }
+    expect(diagnostics.status).toBe('completed')
+    const issue = diagnostics.security.find(finding => finding.skill_id === 'secret-demo')
+    expect(issue?.code).toBe('secret-exposure')
+    expect(issue?.severity).toBe('high')
+  })
+
+  it('does not invoke the security provider when securityEnabled is false', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    // The same credential-like body the securityEnabled: true test flags must
+    // produce no finding here: securityEnabled gates the provider at runner
+    // construction, so the local provider is never wired in to run.
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_secret_off',
+      summary: 'create a skill with a secret',
+      edits: [{
+        action: 'create', kind: 'skill', id: 'secret-demo-off', blastRadius: 'project',
+        description: 'Use whenever handling tokens',
+        content: '## Steps\n1. Call the API with ' + ('sk-' + 'abcdef1234567890abcdef1234567890'),
+      }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-sec-off').agent))
+    expect(json.applied).toBe(1)
+    const diagnostics = json.diagnostics as { status: string; security: Array<Record<string, unknown>> }
+    expect(diagnostics.status).toBe('completed')
+    expect(diagnostics.security).toEqual([])
+  })
+})
+
+describe('harness_refine bundle materialization result', () => {
+  it('reports materialization status and writes the bundle files', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_bundle',
+      summary: 'create a bundle skill',
+      edits: [{
+        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
+        description: 'Use whenever bundling',
+        content: '## Steps\n1. Run `scripts/bundle.py`',
+        files: { 'scripts/bundle.py': 'print(1)', 'references/t.md': '# t' },
+      }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent)
+    const json = resultJson(result)
+    expect(json.applied).toBe(1)
+    const materialization = json.materialization as {
+      status: string
+      written: string[]
+      unchanged: string[]
+      skipped: string[]
+      removed: string[]
+      errors: unknown[]
+    }
+    expect(materialization).toEqual({
+      status: 'completed',
+      written: [
+        join(home, 'skills', 'bundle-demo', 'SKILL.md'),
+        join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'),
+        join(home, 'skills', 'bundle-demo', 'references', 't.md'),
+      ],
+      unchanged: [],
+      skipped: [],
+      removed: [],
+      errors: [],
+    })
+    expect(existsSync(join(home, 'skills', 'bundle-demo', 'SKILL.md'))).toBe(true)
+    expect(readFileSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'), 'utf8')).toBe('print(1)')
+  })
+
+  it('deletes a user-added file from an owned bundle on the next update', async () => {
+    const home = tempHome()
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(ToolRuntime)
+    // seed the owned bundle through the store (an update plan cannot create a
+    // missing entry), then drop a foreign file into it
+    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    seeder.applyRefinement(stubAgent('seed-executor').agent, {
+      id: 'refine_seed_bundle',
+      summary: 'create a bundle skill',
+      edits: [{
+        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
+        description: 'Use whenever bundling',
+        content: '## Steps\n1. Run `scripts/bundle.py`',
+        files: { 'scripts/bundle.py': 'print(1)' },
+      }],
+    }, { global: true })
+    writeFileSync(join(home, 'skills', 'bundle-demo', 'notes.md'), 'manual notes')
+    ctx.provide('llm', makePlanLlm({
+      id: 'refine_bundle_update',
+      summary: 'update the bundle skill',
+      edits: [{
+        action: 'update', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
+        description: 'Use whenever bundling',
+        content: '## Steps\n1. Run `scripts/bundle.py`',
+        files: { 'scripts/bundle.py': 'print(2)' },
+        reason: 'bump the script',
+      }],
+    }) as never)
+    await ctx.plugin(plugin, pluginConfig(home))
+
+    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent)
+    const json = resultJson(result)
+    const materialization = json.materialization as { removed: string[] }
+    expect(materialization.removed).toEqual([join(home, 'skills', 'bundle-demo', 'notes.md')])
+    expect(existsSync(join(home, 'skills', 'bundle-demo', 'notes.md'))).toBe(false)
+  })
+})

@@ -1,0 +1,22 @@
+node_modules/
+lib/
+*.tsbuildinfo
+pnpm-debug.log
+coverage/
+.DS_Store
+tmp/
+*.log
+.npm-cache/
+.pnpm-store/
+# Local design docs (brainstorming artifacts, never committed)
+docs/superpowers/
+
+# Subagent-driven development workspace (never commit)
+.superpowers/
+
+# Git worktrees (never commit)
+.worktrees/
+
+# Local verification baseline: the corpus is real cross-project work data (paths
+# and content fragments), so it stays local only (D2/C)
+verify/

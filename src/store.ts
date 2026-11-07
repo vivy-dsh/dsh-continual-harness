@@ -1,0 +1,519 @@
+/**
+ * The harness store: read/merge/apply/rollback over local and global state
+ * files, trajectory serialization, and the commit path that persists each
+ * refinement and emits the scoped `harness/refined` event. A plain class
+ * owned by the plugin's `apply`; not a Cordis service.
+ * @module dsh-continual-harness
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import { agentEvents } from '@deepseek-ai/dsh-agent'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import type { Message } from '@deepseek-ai/dsh-llm'
+import type { Session } from '@deepseek-ai/dsh-session'
+import { buildSnapshot } from './benchmark.ts'
+import type { HarnessSnapshot } from './benchmark.ts'
+import { REFINEMENT_KINDS } from './domain.ts'
+import { applyRefinementProposal, entryToEditFields, rollbackProposal, touchedSkillIds } from './refine.ts'
+import { buildQueryFromSession, buildStableAnchor, DEFAULT_ENTRIES_PER_KIND, DEFAULT_INDEX_LINES, formatHarnessStateForPromptStructured, STABLE_ANCHOR_NOTE, type InjectionAnchor } from './render.ts'
+import { projectTagFor } from './project.ts'
+import { defaultSkillFsOps, inspectSkillBundle, reconcileSkillFiles } from './skills-fs.ts'
+import { DEFAULT_SKILL_BUNDLE_LIMITS } from './skills.ts'
+import type { SkillBundleLimits } from './skills.ts'
+import {
+  appendGlobalRefinement,
+  appendLocalRefinement,
+  appendUsageEvents,
+  defaultHarnessHome,
+  getGlobalHarnessStateDir,
+  getLocalHarnessStateDir,
+  loadGlobalRefinementHistory,
+  loadHarnessState,
+  loadSessionRefinementHistory,
+  loadUsageEvents,
+  mergeHarnessStates,
+  mergeRefinementHistory,
+  saveHarnessState,
+} from './storage.ts'
+import type { SessionProjectionState } from './session-state.ts'
+import { aggregateUsage } from './usage.ts'
+import type { HarnessState, MaterializationResult, RefinementKind, RefinementProposal, RefinementResult } from './types.ts'
+
+/** Default tail-biased trajectory window for planning (spec §2.3: 12k). */
+export const DEFAULT_TRAJECTORY_MAX_CHARS = 12_000
+
+/** Default fraction of the trajectory budget kept verbatim (spec §2.3). */
+export const DEFAULT_TRAJECTORY_SIGNAL_RATIO = 0.5
+
+/** Per-role char caps shared by the trajectory digest and signal layers. */
+export const TRAJECTORY_ROLE_CAPS = { user: 300, assistant: 200 } as const
+
+/** Options for a store commit. */
+export interface CommitOptions {
+  /** Commit to the cross-session global store instead of the session store. */
+  global?: boolean
+  /** When set, the commit is recorded as the rollback of this refinement id. */
+  rollbackOf?: string
+  /** Marks the commit as riding the automatic path (gate), enabling protected-layer checks. */
+  automatic?: boolean
+  /**
+   * Target-store state captured at planning time, used for baseline conflict
+   * detection: an edit whose target entry changed between planning and commit
+   * is rejected. When absent (rollback/promote), the commit-time read is used.
+   */
+  baseline?: HarnessState
+}
+
+/** Persistent harness store owned by the plugin. */
+export class HarnessStore {
+  /** Harness home directory (defaults under the dsh home). */
+  readonly home: string
+  /** Skills directory where effective skill entries materialize as SKILL.md. */
+  readonly skillsDir: string
+  /** Per-commit entry growth fraction cap; 0 (default) disables the check. */
+  private readonly maxEntryGrowth: number | undefined
+  /** Kinds protected from the automatic path; plumbed for Config wiring. */
+  private readonly protectedKinds: readonly RefinementKind[] | undefined
+  /** Kinds another component owns: direct create/update refused, never injected. */
+  private readonly ownedKinds: readonly RefinementKind[] | undefined
+  /** Skill bundle limits used by L1 files validation (spec §7.10). */
+  private readonly skillBundleLimits: SkillBundleLimits
+  /** Per-kind cap for ranked prompt injection. */
+  private readonly maxInjectedEntriesPerKind: number
+  /** What the injected block is ranked against: the live question or a session-stable anchor. */
+  private readonly injectionAnchor: InjectionAnchor
+  private readonly workspacePathFor: ((sessionId: string) => string | undefined) | undefined
+  /** In-memory injection telemetry, loaded once from usage.events.jsonl. */
+  private usage: Record<string, { injectionCount: number; lastInjectedAt?: string }> | undefined
+  /** Per-session projection facts observed while the plugin runs; nothing is persisted. */
+  private readonly projections = new Map<string, SessionProjectionState>()
+
+  constructor(
+    private readonly ctx: Context,
+    options: {
+      harnessRoot?: string
+      skillsDir?: string
+      maxEntryGrowth?: number
+      protectedKinds?: readonly RefinementKind[]
+      /** Kinds written by another component; the plugin passes its owner list here. */
+      ownedKinds?: readonly RefinementKind[]
+      skillBundleLimits?: SkillBundleLimits
+      maxInjectedEntriesPerKind?: number
+      injectionAnchor?: InjectionAnchor
+      /** Canonical directory of the Workspace accounting a session, when the deployment has Workspaces. */
+      workspacePathFor?: (sessionId: string) => string | undefined
+    } = {},
+  ) {
+    this.home = options.harnessRoot ?? defaultHarnessHome()
+    this.skillsDir = options.skillsDir ?? dshHomePath('skills')
+    this.maxEntryGrowth = options.maxEntryGrowth
+    this.protectedKinds = options.protectedKinds
+    this.ownedKinds = options.ownedKinds
+    this.skillBundleLimits = options.skillBundleLimits ?? DEFAULT_SKILL_BUNDLE_LIMITS
+    this.maxInjectedEntriesPerKind = options.maxInjectedEntriesPerKind ?? DEFAULT_ENTRIES_PER_KIND
+    // Keep this in step with the config schema's default: a store built outside
+    // the plugin must render the mode the plugin itself would have used.
+    this.injectionAnchor = options.injectionAnchor ?? 'stable'
+    this.workspacePathFor = options.workspacePathFor
+  }
+
+  /**
+   * The kinds this harness may write and inject: every kind minus the ones
+   * another component owns. Stores built without `ownedKinds` keep all kinds.
+   */
+  get injectableKinds(): readonly RefinementKind[] {
+    const owned = this.ownedKinds
+    return owned === undefined ? REFINEMENT_KINDS : REFINEMENT_KINDS.filter(kind => !owned.includes(kind))
+  }
+
+  /** The session-local state for an agent; migration diagnostics are logged. */
+  localState(agent: Agent): HarnessState {
+    return loadHarnessState(
+      getLocalHarnessStateDir(this.home, String(agent.session.id)),
+      diagnostics => this.logMigration(diagnostics),
+    )
+  }
+
+  /**
+   * The session's tracked projection facts; empty until the observer records
+   * one. Facts are derivable from committed events and from current surface
+   * state, so nothing is read from or written to disk here.
+   */
+  sessionProjection(session: Session): SessionProjectionState {
+    return this.projections.get(String(session.id)) ?? {}
+  }
+
+  /** Merge newly observed projection facts; an unchanged patch is a no-op. */
+  recordSessionProjection(session: Session, patch: SessionProjectionState): void {
+    const key = String(session.id)
+    const current = this.projections.get(key) ?? {}
+    const next = { ...current, ...patch }
+    if (next.harnessStateSeq === current.harnessStateSeq && next.cacheEvidence === current.cacheEvidence) return
+    this.projections.set(key, next)
+  }
+
+  /** The cross-session global state; migration diagnostics are logged. */
+  globalState(): HarnessState {
+    return loadHarnessState(getGlobalHarnessStateDir(this.home), diagnostics => this.logMigration(diagnostics))
+  }
+
+  private logMigration(diagnostics: string[]): void {
+    for (const diagnostic of diagnostics) this.ctx.logger('harness').warn(`state migration: ${diagnostic}`)
+  }
+
+  /** The merged view the model sees: local shadows same-id global entries. */
+  state(agent: Agent): HarnessState {
+    return mergeHarnessStates(this.globalState(), this.localState(agent))
+  }
+
+  /**
+   * Capture a read-only snapshot of the merged local/global state without
+   * persisting anything: no files are written, no entries are mutated or
+   * stamped, and no injection or usage tracking is triggered. The returned
+   * snapshot's `state` is a structured-clone copy of the merged view and its
+   * `layers` retain the two source stores, so a candidate can be derived by
+   * applying a refinement to its own layer; persist it with
+   * `captureReferenceSnapshot`.
+   */
+  captureSnapshot(agent: Agent, snapshotId: string, refinementId?: string): HarnessSnapshot {
+    // read each layer once; the merged state is derived from them, so no
+    // interleaved writer can persist layers that do not merge to the state
+    const local = this.localState(agent)
+    const global = this.globalState()
+    return buildSnapshot(mergeHarnessStates(global, local), snapshotId, refinementId, { local, global })
+  }
+
+  /**
+   * Merged refinement history: the session journal (full records, first for
+   * dedupe-by-id fidelity), then the session state copy (conclusion-only),
+   * then the cross-session history (full records).
+   */
+  history(agent: Agent): RefinementResult[] {
+    const sessionKey = String(agent.session.id)
+    const local = [
+      ...loadSessionRefinementHistory(this.home, sessionKey),
+      ...this.localState(agent).refinements,
+    ]
+    return mergeRefinementHistory(local, loadGlobalRefinementHistory(this.home))
+  }
+
+  /** fs-backed create-conflict gate: a create onto a non-harness-owned bundle is rejected (spec §7.4). */
+  private createConflictError(id: string): string | undefined {
+    const inspected = inspectSkillBundle(defaultSkillFsOps, this.skillsDir, id)
+    if (inspected.state === 'missing' || (inspected.state === 'present' && inspected.harnessOwned)) return undefined
+    return `skill directory "${id}" exists and is not harness-owned; pick another id`
+  }
+
+  /** Structured overview + injected keys + the merged state behind them, so one read serves both. */
+  render(agent: Agent): { overview: string; injectedKeys: string[]; matchedKeys: string[]; state: HarnessState } {
+    const local = this.localState(agent)
+    const state = mergeHarnessStates(this.globalState(), local)
+    const stable = this.injectionAnchor === 'stable'
+    // The stable anchor (session opening request + creation cwd) does not move
+    // as the conversation advances, so the rendered block stays byte-identical
+    // between turns and only a state change republishes it — the prefix the
+    // provider caches survives. Detail then moves to on-demand reads.
+    const anchor = stable ? buildStableAnchor(agent.session) : buildQueryFromSession(agent.session)
+    // Ownership only orders the index, so only the stable render may pay for the
+    // workspace lookup and the filesystem walk that names the project.
+    const project = stable ? this.projectTagOf(agent) : undefined
+    const rendered = formatHarnessStateForPromptStructured(state, anchor, {
+      maxPerKind: this.maxInjectedEntriesPerKind,
+      sessionId: String(agent.session.id),
+      isLocal: (kind, id) => local.entries[kind][id] !== undefined,
+      // The harness injects only the kinds it owns; another component's kinds
+      // reach the model through that component's own projection.
+      kinds: this.injectableKinds,
+      ...(stable ? { indexLines: DEFAULT_INDEX_LINES, anchorNote: STABLE_ANCHOR_NOTE } : {}),
+      ...(stable && project !== undefined ? { project } : {}),
+    })
+    return { ...rendered, state }
+  }
+
+  /** Lazy-load injection telemetry into memory. */
+  private usageStats(): Record<string, { injectionCount: number; lastInjectedAt?: string }> {
+    if (this.usage === undefined) {
+      try {
+        this.usage = aggregateUsage(loadUsageEvents(this.home))
+      } catch (error) {
+        this.ctx.logger('harness').warn(`usage load failed: ${String(error)}`)
+        this.usage = {}
+      }
+    }
+    return this.usage
+  }
+
+  /** Record one injection per key: batch-append the events and update memory; never blocks injection. */
+  recordInjections(agent: Agent, injectedKeys: string[]): void {
+    void agent
+    if (injectedKeys.length === 0) return
+    const now = new Date().toISOString()
+    const stats = this.usageStats()
+    const events = injectedKeys.map(key => ({ key, at: now }))
+    try {
+      appendUsageEvents(this.home, events)
+    } catch (error) {
+      this.ctx.logger('harness').warn(`usage append failed: ${String(error)}`)
+    }
+    for (const { key } of events) {
+      const current = stats[key] ?? { injectionCount: 0 }
+      current.injectionCount += 1
+      current.lastInjectedAt = now
+      stats[key] = current
+    }
+  }
+
+  /** Aggregate stats for one usage key (for wrap-up suggestions). */
+  usageStatsFor(key: string): { injectionCount: number; lastInjectedAt?: string } | undefined {
+    return this.usageStats()[key]
+  }
+
+  /** Tail-biased trajectory serialization for the planner. */
+  trajectory(agent: Agent, maxChars: number = DEFAULT_TRAJECTORY_MAX_CHARS, signalRatio = DEFAULT_TRAJECTORY_SIGNAL_RATIO): string {
+    return serializeTrajectory(agent.session, maxChars, signalRatio)
+  }
+
+  /** Project name of the session: DSH's Workspace when it accounts the session, else the repo at cwd. */
+  private projectTagOf(agent: Agent): string | undefined {
+    return projectTagFor(agent.session.header.cwd, this.workspacePathFor?.(String(agent.session.id)))
+  }
+
+  /** The tag as a compact spread, so callers never pass `project: undefined`. */
+  private stampFor(agent: Agent): { project?: string } {
+    const project = this.projectTagOf(agent)
+    return project === undefined ? {} : { project }
+  }
+
+  /**
+   * Commit a planned refinement: apply to the target store with baseline
+   * conflict detection, persist, append the global history when global, and
+   * emit the scoped `harness/refined` event.
+   * The baseline defaults to the commit-time read; callers that planned
+   * against an earlier snapshot pass it via `options.baseline` so edits over
+   * entries changed during planning are rejected.
+   */
+  applyRefinement(
+    agent: Agent,
+    plan: RefinementProposal,
+    options: CommitOptions = {},
+  ): RefinementResult & { materialization: MaterializationResult } {
+    const global = options.global === true
+    const target = global ? this.globalState() : this.localState(agent)
+    const baseline = options.baseline ?? target
+    const { result, state } = applyRefinementProposal(target, plan, {
+      id: plan.id,
+      scope: global ? 'global' : 'local',
+      baselineState: baseline,
+      ...(this.maxEntryGrowth === undefined ? {} : { maxEntryGrowth: this.maxEntryGrowth }),
+      ...(this.protectedKinds === undefined ? {} : { protectedKinds: this.protectedKinds }),
+      ...(this.ownedKinds === undefined ? {} : { ownedKinds: this.ownedKinds }),
+      skillBundleLimits: this.skillBundleLimits,
+      editGate: edit => edit.action === 'create' && edit.kind === 'skill' ? this.createConflictError(edit.id) : undefined,
+      // local commits see the global store read-only through the rule layer
+      ...(global ? {} : { globalEntries: this.globalState().entries }),
+      ...(options.automatic === undefined ? {} : { automatic: options.automatic }),
+      ...(options.rollbackOf === undefined ? {} : { rollbackOf: options.rollbackOf }),
+      sourceSession: String(agent.session.id),
+      // Rollback replays historical edits and must not re-stamp them with
+      // today's project; a live commit records where it was learned.
+      ...(options.rollbackOf === undefined ? this.stampFor(agent) : {}),
+    })
+    if (global) {
+      saveHarnessState(getGlobalHarnessStateDir(this.home), state)
+      appendGlobalRefinement(this.home, result)
+    } else {
+      saveHarnessState(getLocalHarnessStateDir(this.home, String(agent.session.id)), state)
+      appendLocalRefinement(this.home, String(agent.session.id), result)
+    }
+    // No informational session event is appended for the commit: an
+    // out-of-repo append would make the whole log refuse a cold read (see
+    // `registerSessionEventType` in domain.ts for the vocabulary constraint
+    // and why the legacy type stays registered). Durable facts already ride
+    // known vocabulary (`tool/result` for tool commits, `command/done` for
+    // `/refine`) plus the on-disk store. The scoped `harness/refined` emit
+    // below still fires, so live observers and the invariant companion are
+    // unaffected.
+    const materialization = this.materializeSkills(agent, result)
+    agentEvents(this.ctx, agent).emit('harness/refined', { result })
+    return Object.assign(result, { materialization })
+  }
+
+  /** Promote a local entry to global by copy: local stays unchanged; a same-id
+   * global is a deterministic conflict. Not a cross-store transaction. */
+  promoteEntry(agent: Agent, id: string): { applied: boolean; error?: string } {
+    const local = this.localState(agent)
+    const global = this.globalState()
+    const hits = (Object.keys(local.entries) as RefinementKind[])
+      .map(kind => ({ kind, entry: local.entries[kind][id] }))
+      .filter(candidate => candidate.entry !== undefined)
+    if (hits.length === 0) return { applied: false, error: `local entry not found: ${id}` }
+    if (hits.length > 1) return { applied: false, error: `ambiguous local id: ${id}` }
+    const { kind, entry } = hits[0]!
+    if (global.entries[kind][id] !== undefined) return { applied: false, error: 'global id conflict' }
+    const result = this.applyRefinement(agent, {
+      id: `promote_${Date.now()}`,
+      summary: `Promote local ${kind}:${id} to global`,
+      // Promotion is a move to the project layer, so an undeclared entry is
+      // declared 'project' — the reach the operation itself has — while a
+      // declared value is kept as-is (a session-radius entry is then refused by
+      // the destination-layer check rather than silently widened).
+      edits: [{ action: 'create', kind, id, ...entryToEditFields(entry!), reason: 'promote from session wrap-up', ...(entry!.blastRadius === undefined ? { blastRadius: 'project' } : {}) }],
+    }, { global: true })
+    // The commit can legitimately reject the create — a session-radius entry
+    // must not enter the store every session reads (3.4.1) — so reporting
+    // success unconditionally would be a silent false success.
+    const failed = result.appliedEdits.find(edit => !edit.applied)
+    if (failed) return { applied: false, error: failed.error ?? `promote rejected: ${kind}:${id}` }
+    return { applied: true }
+  }
+
+  /**
+   * Materialize the SKILL.md bundles for skill ids touched by a committed
+   * refinement, from the effective merged view, so dsh's filesystem skill
+   * provider picks the generated skills up live. Write faults are collected
+   * into the returned MaterializationResult; the already-persisted commit is
+   * never failed (spec §7.5/§7.7).
+   */
+  private materializeSkills(agent: Agent, result: RefinementResult): MaterializationResult {
+    const touched = touchedSkillIds(result.appliedEdits)
+    if (touched.length === 0) {
+      return { status: 'completed', written: [], unchanged: [], skipped: [], removed: [], errors: [] }
+    }
+    const effective = this.state(agent).entries.skill
+    const activeSkills: typeof effective = {}
+    for (const id of touched) {
+      const entry = effective[id]
+      if (entry !== undefined && entry.metadata?.lifecycleState !== 'archived') activeSkills[id] = entry
+    }
+    try {
+      return reconcileSkillFiles(this.skillsDir, activeSkills, touched)
+    } catch (error) {
+      return {
+        status: 'failed',
+        written: [],
+        unchanged: [],
+        skipped: [],
+        removed: [],
+        errors: [{ code: 'materialize-failed', retryable: true, message: String(error) }],
+      }
+    }
+  }
+
+  /** Roll back a committed refinement by id from the merged history. */
+  rollbackRefinement(
+    agent: Agent,
+    rollbackId: string,
+    options: CommitOptions = {},
+  ): RefinementResult & { materialization: MaterializationResult } {
+    const global = options.global === true
+    const history = global ? loadGlobalRefinementHistory(this.home) : this.history(agent)
+    const target = history.find(result => result.id === rollbackId)
+    if (!target) throw new Error(`no refinement found with id ${rollbackId}`)
+    const plan = rollbackProposal(target)
+    return this.applyRefinement(agent, { ...plan, id: `rollback_${rollbackId}` }, {
+      ...options,
+      rollbackOf: rollbackId,
+    })
+  }
+}
+
+function digestOf(role: 'user' | 'assistant', blocks: Message['content']): string {
+  const text = messageText({ content: blocks })
+  const toolNames = blocks
+    .filter((block): block is Extract<Message['content'][number], { type: 'tool-call' }> =>
+      block.type === 'tool-call')
+    .map(block => block.name)
+  const limit = TRAJECTORY_ROLE_CAPS[role]
+  const cut = text.length > limit ? `${text.slice(0, limit)}…` : text
+  const tools = toolNames.length > 0 ? ` [tools: ${[...new Set(toolNames)].join(', ')}]` : ''
+  return `[${role}] ${cut}${tools}`
+}
+
+/**
+ * Two-layer tail-biased trajectory (spec §2.3): the signal layer keeps the
+ * most recent messages verbatim up to `maxChars * signalRatio`; the digest
+ * layer truncates everything older (user 300 / assistant 200 chars + tool
+ * names). Input is the surface-ordered derived history — the same messages
+ * the host loop already sent — so no event-structure re-parsing is needed.
+ *
+ * Compatibility: the signal layer labels lines `[user/message]` /
+ * `[assistant/message]` exactly like the pre-refactor serializer, so the
+ * existing store.spec assertions keep passing; the digest layer uses the
+ * shorter `[user]` / `[assistant]` tags.
+ */
+export function serializeTrajectory(session: Session, maxChars: number, signalRatio = DEFAULT_TRAJECTORY_SIGNAL_RATIO): string {
+  if (maxChars <= 0) return ''
+  const messages = session.deriveMessages()
+  const signalBudget = Math.floor(maxChars * Math.min(1, Math.max(0, signalRatio)))
+  const digestBudget = maxChars - signalBudget
+
+  // Signal layer: verbatim tail, newest last, labelled with the legacy
+  // event-style tags so existing tests and downstream consumers are stable.
+  // tool-role messages (one tool result each) carry no planner-relevant text —
+  // skip them entirely instead of calling messageText.
+  // A message longer than the digest's per-role cap is digested instead of
+  // kept verbatim: it would burn the signal budget without adding readable
+  // context, and the digest already carries its truncated form.
+  const signalLines: string[] = []
+  let signalUsed = 0
+  let split = messages.length
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]!
+    if (message.role === 'tool') continue
+    const text = messageText(message)
+    if (!text.trim()) continue
+    const cap = TRAJECTORY_ROLE_CAPS[message.role === 'assistant' ? 'assistant' : 'user']
+    if (text.length > cap) break
+    const tag = message.role === 'assistant' ? 'assistant/message' : 'user/message'
+    const line = `[${tag}] ${text}`
+    if (signalUsed + line.length > signalBudget) break
+    signalLines.unshift(line)
+    signalUsed += line.length
+    split = i
+  }
+  // The digest layer mirrors the signal layer: tool-role messages carry no
+  // planner text, so they are skipped rather than emitted as bare `[user]` tag
+  // lines.
+  const digestLines: string[] = []
+  for (let i = 0; i < split; i++) {
+    const message = messages[i]!
+    if (message.role === 'tool') continue
+    digestLines.push(digestOf(message.role === 'assistant' ? 'assistant' : 'user', message.content))
+  }
+  let digest = digestLines.join('\n')
+  if (digest.length > digestBudget) {
+    // Reserve the cut marker (and its newline separator) before slicing the
+    // body, so the digest layer stays within digestBudget and the spec's
+    // "total ≤ maxChars" guarantee holds even when the signal layer uses its
+    // full share (spec §2.3). `markerFor(digestBudget)` has the longest digit
+    // count the body can take, so one refinement pass bounds the marker.
+    const total = digest.length
+    const markerFor = (body: number) => `… (truncated, showing the first ${body} characters of ${total})`
+    const body = Math.max(0, digestBudget - markerFor(digestBudget).length - 2)
+    digest = body > 0
+      ? `${markerFor(body)}\n\n${digest.slice(0, body)}`
+      : markerFor(0).length <= digestBudget ? markerFor(0) : ''
+  }
+  const signal = signalLines.join('\n\n')
+  if (!signal) return digest
+  return digest ? `${digest}\n\n${signal}` : signal
+}
+
+/**
+ * Serialized text of one derived message (text blocks only). A tool result is
+ * its own tool-role message in dsh 0.1.7 — no longer a `tool-result` first
+ * block — and contributes no text to the trajectory or the char budget either
+ * way, hence the role check. `role` stays optional because the digest layer
+ * passes bare blocks.
+ */
+export function messageText(message: Pick<Message, 'content'> & { role?: Message['role'] }): string {
+  if (message.role === 'tool') return ''
+  return message.content
+    // explicit predicate: the `typeof` guard survives the merge-extensible
+    // ContentBlock union (a plugin-added 'text' block may carry non-string text)
+    .filter((block): block is { type: 'text'; text: string } =>
+      block.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n')
+}
