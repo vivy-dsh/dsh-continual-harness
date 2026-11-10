@@ -43,6 +43,7 @@ import type {
 
 /** One-line summary for a refinement result; shared by the tool and command renderers. */
 export function executionSummary(execution: RefineExecutionResult): string {
+  if (execution.dreamRequest) return execution.dreamRequest.skipped ? `Dream request skipped: ${execution.dreamRequest.reason ?? 'no eligible evidence'}` : `Manual Dream request queued: ${execution.dreamRequest.id ?? 'pending'} (${execution.dreamRequest.status ?? 'pending'}), Input: ${execution.dreamRequest.inputId ?? 'pending'}`
   return execution.refinement?.summary ?? execution.error?.message ?? 'no refinement produced'
 }
 
@@ -379,7 +380,7 @@ export function createRefineCoordinator(options: RefineCoordinatorOptions): Refi
       if (request.signal?.aborted) return errorResult('planning', 'aborted', 'refinement request aborted')
       if (proposal.edits.length === 0) return emptyResult()
 
-      const requiresApproval = request.scope === 'global' && request.source === 'tool' && options.requireGlobalApprovalForTool === true
+      const requiresApproval = !options.skillOwner && request.scope === 'global' && request.source === 'tool' && options.requireGlobalApprovalForTool === true
       let approval: RefineExecutionResult['approval'] = 'not-required'
       if (requiresApproval) {
         if (!options.requireGlobalApproval) return errorResult('approval', 'approval-unavailable', 'global approval service unavailable')
@@ -397,6 +398,24 @@ export function createRefineCoordinator(options: RefineCoordinatorOptions): Refi
       const key = request.scope === 'global' ? 'global' : `local:${String(request.agent.session.id)}`
       return mutex.run(key, async () => {
         if (request.signal?.aborted) return errorResult('commit', 'aborted', 'refinement request aborted', approval)
+        if (options.skillOwner) {
+          // Manual callers and automatic callers use the same owner. Nothing is
+          // applied to harness state or discoverable skill files before this gate.
+          for (const edit of (proposal as RefinementProposal).edits.filter(edit => edit.kind === 'skill')) {
+            if (request.source === 'automatic' || !request.ticketId || !request.subjectId || !request.evidenceRefs?.length) return errorResult('validation', 'invalid-request', 'Skill refinement requires an ordinary authorized Dream Ticket, subject and original evidence references', approval)
+            if (edit.action === 'delete' || edit.archive === true) return errorResult('validation', 'invalid-proposal', 'Skill removal must be proposed through the owner lifecycle', approval)
+            const prior = baseline.entries.skill[edit.id] as import('./types.ts').SkillEntry | undefined
+            const entry = { ...prior, ...edit }
+            if (typeof entry.content !== 'string') return errorResult('validation', 'invalid-proposal', 'Skill candidate body is missing', approval)
+            try {
+              const candidate = options.skillOwner.stageCandidate({ skillId: edit.id, entry: { content: entry.content, ...(entry.description === undefined ? {} : { description: entry.description }), ...(entry.files === undefined ? {} : { files: entry.files }) }, expectedDigest: options.skillOwner.currentDigest(edit.id), subjectId: request.subjectId, ticketId: request.ticketId, evidenceRefs: request.evidenceRefs, idempotencyKey: `refine:${proposal.id}:${edit.id}` })
+              const validation = await options.skillOwner.validateCandidate(candidate.candidateId)
+              if (validation.status !== 'passed' || !validation.receiptId) return errorResult('validation', 'invalid-proposal', `Skill candidate ${candidate.candidateId} ${validation.status}: ${validation.reason ?? 'validation incomplete'}`, approval)
+              if (request.signal?.aborted) return errorResult('commit', 'aborted', 'refinement request aborted', approval)
+              await options.skillOwner.publishCandidate({ candidateId: candidate.candidateId, receiptId: validation.receiptId, idempotencyKey: `refine:${proposal.id}:${edit.id}`, subjectId: request.subjectId, ticketId: request.ticketId })
+            } catch (error) { return errorResult('validation', 'invalid-proposal', error instanceof Error ? error.message : String(error), approval) }
+          }
+        }
         // The Store re-reads the target state inside applyRefinement for
         // commit-time conflict detection (spec §5.1/§6.3); the coordinator
         // captured its planner baseline once and does not re-read here.

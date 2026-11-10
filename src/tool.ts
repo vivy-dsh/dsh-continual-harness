@@ -19,7 +19,7 @@ import type { HarnessStore } from './store.ts'
 import type { DiagnosticReport, MaterializationResult } from './types.ts'
 import { suggestWrapup } from './wrapup.ts'
 
-const DESCRIPTION = 'Refine the continual harness: persist small, evidence-backed skill contracts from the current trajectory, delete harness entries left over from earlier builds, or roll back a prior refinement. Memory, prompts, and subagent specs are owned elsewhere — ActMem owns memory, Laputa or the Superagent prompt layer owns prompts, and the Superagent Agent registry owns subagent specs — so this tool rejects any create or update of those kinds and accepts only their deletion, for cleanup. Prefer this tool over any standalone skill-authoring skill whenever the user asks to turn what we just did into a reusable skill — e.g. "把xxx流程做成skill", "save our process as a skill", "create a skill from this workflow". The base system prompt is immutable; only this supplemental layer changes. Use after a repeated failure or a reusable tactic. Pass instructions to focus the planner. Keep edits small and evidence-backed.'
+const DESCRIPTION = 'Submit manual refinement only when the user explicitly asks to refine or save this session workflow as a skill. This queues an ordinary Superagent Input and Ticket through Evolution; it does not directly modify assets. Do not invoke autonomously after failures or successful tactics. Startup AutoDream owns automatic evolution. Skills activate only after owner-controlled execution and independent holdout validation; persona changes remain proposals. ActMem owns memory and Laputa owns persona. Defaults to evidence from the current session. Use cross_session only when the user explicitly requests cross-session refinement.'
 
 /** Tool-facing options resolved by the plugin. */
 export interface ToolOptions {
@@ -231,16 +231,17 @@ export function registerHarnessTool(ctx: Context, coordinator: RefineCoordinator
       },
       global: {
         type: 'boolean',
-        description: 'Target the cross-session global store instead of the session-local one. Omit for the deployment default.',
+        description: 'Legacy output scope hint. Evidence remains current-session unless cross_session is explicitly requested.',
       },
       rollback_id: {
         type: 'string',
-        description: 'Roll back the refinement with this id instead of planning new edits.',
+        description: 'Legacy direct rollback is refused. Request a validated owner rollback through a new manual refinement instead.',
       },
       ticket_id: {
         type: 'string',
-        description: 'Superagent ticket that owns this refinement. Cross-domain edit candidates (prompt/memory/subagent) are recorded as Evolution proposals against it; without one they wait for a later call that has one.',
+        description: 'Legacy hint only. Evolution creates and verifies the ordinary Ticket for this manual request.',
       },
+      cross_session: { type: 'boolean', description: 'Use cross-session evidence only on the user\'s explicit request. Defaults to false.' },
     },
     output: {
       schema: OUTPUT_SCHEMA,
@@ -252,7 +253,7 @@ export function registerHarnessTool(ctx: Context, coordinator: RefineCoordinator
       const global = args.global ?? options.defaultGlobal
       const request = args.rollback_id
         ? { mode: 'rollback' as const, source: 'tool' as const, scope: global ? 'global' as const : 'local' as const, rollbackId: args.rollback_id, agent, signal: exec.signal }
-        : { mode: 'plan' as const, source: 'tool' as const, scope: global ? 'global' as const : 'local' as const, agent, ...(args.instructions === undefined ? {} : { instructions: args.instructions }), ...(args.ticket_id === undefined ? {} : { ticketId: args.ticket_id }), signal: exec.signal }
+        : { mode: 'plan' as const, source: 'tool' as const, scope: global ? 'global' as const : 'local' as const, agent, ...(args.instructions === undefined ? {} : { instructions: args.instructions }), ...(args.ticket_id === undefined ? {} : { ticketId: args.ticket_id }), ...(args.cross_session === true ? { crossSession: true } : {}), signal: exec.signal }
       const execution = await coordinator.execute(request)
       return summarizeExecution(execution, global ? 'global' : 'local')
     },

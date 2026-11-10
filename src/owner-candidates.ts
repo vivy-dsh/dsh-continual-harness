@@ -17,7 +17,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { callComponent } from '../../_shared/ipc.mjs'
+import { callComponent } from 'dsh-continual-harness/internal-ipc'
 import type { RefineCoordinator, RefineExecutionResult, RefineRequest } from './coordinator-types.ts'
 import type { AppliedRefinementEdit, RefinementResult } from './types.ts'
 

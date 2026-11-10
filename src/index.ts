@@ -13,33 +13,29 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { isAbsolute, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
-import { requireGlobalApproval } from './approval.ts'
 import {
   DEFAULT_PLANNER_SAFETY_RESERVE_TOKENS, DEFAULT_TOKEN_PER_CHAR_RATIO, MIN_PLANNER_OUTPUT_TOKENS,
 } from './budget.ts'
-import { completeViaAgent, DEFAULT_PLANNER_MAX_TOKENS } from './complete.ts'
+import { DEFAULT_PLANNER_MAX_TOKENS } from './complete.ts'
 import type { PlannerPrefixCacheMode } from './cache-detect.ts'
-import { createRefineCoordinator } from './coordinator.ts'
 import { registerRefineCommand } from './command.ts'
 import type { CommandsCapability } from './command.ts'
-import { createDiagnosticRunner, structuralProvider } from './diagnostics.ts'
-import { securityProvider } from './scan.ts'
 import { DEFAULT_COOLDOWN_MS, DEFAULT_TURN_INTERVAL } from './driver.ts'
 import { DEFAULT_SKILL_BUNDLE_LIMITS } from './skills.ts'
 import { HARNESS_REFINEMENT_EVENT, OWNED_REFINEMENT_KINDS, registerSessionEventType } from './domain.ts'
 import { attachFileLog, PLUGIN_LOG_FILE_NAME } from './logfile.ts'
 import { DEFAULT_TRAJECTORY_MAX_CHARS, DEFAULT_TRAJECTORY_SIGNAL_RATIO } from './store.ts'
 import type { InjectionAnchor } from './render.ts'
-import {
-  decorateWithOwnerCandidates,
-  forwardAppliedOwnerCandidates,
-  retryPendingOwnerCandidates,
-} from './owner-candidates.ts'
 import { workspacePathFor, type WorkspaceRegistryLike } from './project.ts'
 import { registerHarnessProjection } from './projection.ts'
 import { registerSessionProjectionObserver } from './session-state.ts'
 import { installHostRequestSnapshot } from './request-snapshot.ts'
 import { HarnessStore } from './store.ts'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import { SkillOwner } from './skill-owner.ts'
+import { createManualDreamCoordinator } from './dream-adapter.ts'
+import { createRuntimeSkillOwner } from './skill-owner-runtime.ts'
+import { defaultHarnessHome } from './storage.ts'
 import { registerBenchmarkTool } from './tool-benchmark.ts'
 import { registerHarnessTool, registerHarnessWrapup } from './tool.ts'
 import type { RefinementKind } from './types.ts'
@@ -264,8 +260,12 @@ export function apply(ctx: Context, config: Config): void {
   // than pointing at a directory that cannot exist.
   const dshHome = process.env.DSH_HOME
   const candidateHome = dshHome !== undefined && isAbsolute(dshHome) ? dshHome : undefined
+  const skillOwner = candidateHome
+    ? createRuntimeSkillOwner(ctx, candidateHome, config.skillsDir ?? dshHomePath('skills'))
+    : new SkillOwner(join(config.harnessRoot ?? defaultHarnessHome(), 'skill-owner'), async () => false, { skillsDir: config.skillsDir ?? dshHomePath('skills') })
 
   const store = new HarnessStore(ctx, {
+    skillOwner,
     ...(config.harnessRoot === undefined ? {} : { harnessRoot: config.harnessRoot }),
     ...(config.skillsDir === undefined ? {} : { skillsDir: config.skillsDir }),
     maxEntryGrowth: config.maxEntryGrowth,
@@ -283,68 +283,16 @@ export function apply(ctx: Context, config: Config): void {
     injectionAnchor: config.injectionAnchor,
     ...(workspaces === undefined ? {} : { workspacePathFor: (sessionId: string) => workspacePathFor(workspaces, sessionId) }),
   })
+  skillOwner.migrateLegacy(Object.values(store.globalState().entries.skill))
   // One protocol-independent coordinator owns request validation, planner
   // context capture, approval gating, commit serialization, and result
   // projection for both the tool and the automatic driver. The same
   // coordinator carries the post-apply diagnostics runner, so tool, command,
   // and automatic gate all see one report per commit.
-  const hostRequests = installHostRequestSnapshot(ctx)
-  const rawCoordinator = createRefineCoordinator({
-    store,
-    logger: ctx.logger('harness'),
-    completeFor: agent => completeViaAgent(ctx, agent, config.plannerMaxTokens),
-    maxTrajectoryChars: config.maxTrajectoryChars,
-    hostRequests,
-    resolveContextWindow: async (provider, model, signal) => {
-      try {
-        const info = await ctx.llm.resolveModelInfo(provider, model, signal)
-        return info?.context?.contextWindow
-      } catch {
-        return undefined
-      }
-    },
-    // exactOptionalPropertyTypes: only present the optional fields when set.
-    ...(config.plannerTokenPerCharRatio === undefined ? {} : { plannerTokenPerCharRatio: config.plannerTokenPerCharRatio }),
-    ...(config.plannerSafetyReserveTokens === undefined ? {} : { plannerSafetyReserveTokens: config.plannerSafetyReserveTokens }),
-    ...(config.minPlannerOutputTokens === undefined ? {} : { minPlannerOutputTokens: config.minPlannerOutputTokens }),
-    plannerMaxTokens: config.plannerMaxTokens,
-    // exactOptionalPropertyTypes: only present the optional fields when set.
-    ...(config.plannerPrefixCache === undefined ? {} : { plannerPrefixCache: config.plannerPrefixCache }),
-    ...(config.trajectorySignalRatio === undefined ? {} : { trajectorySignalRatio: config.trajectorySignalRatio }),
-    ...(config.diagnosticsEnabled
-      ? {
-        diagnostics: createDiagnosticRunner({
-          structural: structuralProvider,
-          ...(config.securityEnabled ? { security: securityProvider } : {}),
-          enableSecurity: config.securityEnabled,
-        }),
-      }
-      : {}),
-    // The conservative approval gate rides the tool plan path only: the user
-    // sees the planner's own summary before any global write commits. The
-    // thrown message keeps the historical "global write not approved" wording
-    // so the tool's not-committed summary stays recognizable.
-    ...(config.requireGlobalApproval
-      ? {
-        requireGlobalApproval: async (agent, signal, summary) => {
-          try {
-            await requireGlobalApproval(ctx, agent, signal, `Target: global store; planner plan: ${summary}`)
-          } catch (error) {
-            throw new Error(`global write not approved: ${error instanceof Error ? error.message : String(error)}`)
-          }
-        },
-        requireGlobalApprovalForTool: true,
-      }
-      : {}),
-  })
-  // The single coordinator serves the tool, the command and the automatic gate,
-  // so decorating it here hands over cross-domain candidates from every path.
-  const coordinator = candidateHome === undefined
-    ? rawCoordinator
-    : decorateWithOwnerCandidates(rawCoordinator, {
-      forward: input => forwardAppliedOwnerCandidates({ home: candidateHome, harnessRoot: store.home, ...input }),
-      retryPending: () => retryPendingOwnerCandidates({ home: candidateHome, harnessRoot: store.home }),
-    })
+  installHostRequestSnapshot(ctx)
+  // Production refinement always enters ordinary Superagent Input/Ticket control.
+  // The legacy planning library remains available to tests and embedders only.
+  const coordinator = createManualDreamCoordinator(candidateHome)
   registerHarnessTool(ctx, coordinator, {
     defaultGlobal: config.defaultGlobal,
   })

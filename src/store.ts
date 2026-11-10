@@ -21,6 +21,7 @@ import { projectTagFor } from './project.ts'
 import { defaultSkillFsOps, inspectSkillBundle, reconcileSkillFiles } from './skills-fs.ts'
 import { DEFAULT_SKILL_BUNDLE_LIMITS } from './skills.ts'
 import type { SkillBundleLimits } from './skills.ts'
+import type { SkillOwner } from './skill-owner.ts'
 import {
   appendGlobalRefinement,
   appendLocalRefinement,
@@ -67,6 +68,7 @@ export interface CommitOptions {
 
 /** Persistent harness store owned by the plugin. */
 export class HarnessStore {
+  private readonly skillOwner: SkillOwner | undefined
   /** Harness home directory (defaults under the dsh home). */
   readonly home: string
   /** Skills directory where effective skill entries materialize as SKILL.md. */
@@ -103,6 +105,7 @@ export class HarnessStore {
       injectionAnchor?: InjectionAnchor
       /** Canonical directory of the Workspace accounting a session, when the deployment has Workspaces. */
       workspacePathFor?: (sessionId: string) => string | undefined
+      skillOwner?: SkillOwner
     } = {},
   ) {
     this.home = options.harnessRoot ?? defaultHarnessHome()
@@ -116,6 +119,7 @@ export class HarnessStore {
     // the plugin must render the mode the plugin itself would have used.
     this.injectionAnchor = options.injectionAnchor ?? 'stable'
     this.workspacePathFor = options.workspacePathFor
+    this.skillOwner = options.skillOwner
   }
 
   /**
@@ -309,7 +313,16 @@ export class HarnessStore {
       ...(this.protectedKinds === undefined ? {} : { protectedKinds: this.protectedKinds }),
       ...(this.ownedKinds === undefined ? {} : { ownedKinds: this.ownedKinds }),
       skillBundleLimits: this.skillBundleLimits,
-      editGate: edit => edit.action === 'create' && edit.kind === 'skill' ? this.createConflictError(edit.id) : undefined,
+      editGate: edit => {
+        if (edit.kind === 'skill' && this.skillOwner) {
+          const prior = target.entries.skill[edit.id] as import('./types.ts').SkillEntry | undefined
+          if (edit.action === 'delete' || edit.archive === true) return 'skill deletion requires an owner publication'
+          const entry = { ...prior, ...edit }
+          if (typeof entry.content !== 'string' || !this.skillOwner.matchesLive(edit.id, { content: entry.content, ...(entry.description === undefined ? {} : { description: entry.description }), ...(entry.files === undefined ? {} : { files: entry.files }) })) return 'skill candidate has not been validated and published by SkillOwner'
+          return undefined
+        }
+        return edit.action === 'create' && edit.kind === 'skill' ? this.createConflictError(edit.id) : undefined
+      },
       // local commits see the global store read-only through the rule layer
       ...(global ? {} : { globalEntries: this.globalState().entries }),
       ...(options.automatic === undefined ? {} : { automatic: options.automatic }),
@@ -376,6 +389,7 @@ export class HarnessStore {
    * never failed (spec §7.5/§7.7).
    */
   private materializeSkills(agent: Agent, result: RefinementResult): MaterializationResult {
+    if (this.skillOwner) return { status: 'completed', written: [], unchanged: [], skipped: [], removed: [], errors: [] }
     const touched = touchedSkillIds(result.appliedEdits)
     if (touched.length === 0) {
       return { status: 'completed', written: [], unchanged: [], skipped: [], removed: [], errors: [] }

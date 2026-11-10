@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -202,54 +202,9 @@ describe('plugin registration', () => {
     ).rejects.toThrow()
   })
 
-  it('rolls back a prior global refinement through the tool without an LLM', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    seeder.applyRefinement(stubAgent('seeder').agent, {
-      id: 'refine_seed',
-      summary: 'seed a global memory',
-      edits: [{ action: 'create', kind: 'memory', id: 'seed', blastRadius: 'project', content: 'x' }],
-    }, { global: true })
-
-    const result = await execute(ctx, 'harness_refine', { rollback_id: 'refine_seed' }, stubAgent('executor').agent)
-    const json = resultJson(result)
-    expect(json.refinement_id).toBe('rollback_refine_seed')
-    expect(json.scope).toBe('global')
-    expect(json.applied).toBe(1)
-
-    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    expect(fresh.globalState().entries.memory['seed']).toBeUndefined()
-  })
 })
 
 describe('governance default mode', () => {
-  it('performs a global write without consulting the approval service', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm(PLAN) as never)
-
-    const stub = { ask: vi.fn(async () => ({ value: 'approve' })) }
-    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('default-mode').agent)
-    const json = resultJson(result)
-    expect(json.refinement_id).toBe('refine_appr')
-    expect(json.applied).toBe(1)
-    expect(stub.ask).not.toHaveBeenCalled()
-
-    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    expect(fresh.globalState().entries.skill['m1']?.content).toBe('learned')
-  })
 
   it('leaves automatic refinement to the orchestrator: a turn threshold records nothing and disposes nothing', async () => {
     const home = tempHome()
@@ -281,53 +236,6 @@ describe('governance default mode', () => {
   })
 })
 
-describe('governance conservative mode', () => {
-  it('blocks a global write the user rejects', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm(PLAN) as never)
-
-    const stub = { ask: vi.fn(async () => ({ value: 'reject' })) }
-    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
-    await ctx.plugin(plugin, { ...pluginConfig(home), requireGlobalApproval: true })
-
-    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('reject-mode').agent)
-    const json = resultJson(result)
-    expect(json.refinement_id).toBe('none')
-    expect(json.scope).toBe('global')
-    expect(json.summary).toContain('not approved')
-    expect(json.applied).toBe(0)
-    expect(stub.ask).toHaveBeenCalledOnce()
-
-    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    expect(fresh.globalState().entries.skill['m1']).toBeUndefined()
-  })
-
-  it('allows a global write the user approves', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm(PLAN) as never)
-
-    const stub = { ask: vi.fn(async () => ({ value: 'approve' })) }
-    ;(ctx as { userQuestions?: unknown }).userQuestions = stub
-    await ctx.plugin(plugin, { ...pluginConfig(home), requireGlobalApproval: true })
-
-    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('approve-mode').agent)
-    const json = resultJson(result)
-    expect(json.refinement_id).toBe('refine_appr')
-    expect(json.applied).toBe(1)
-    expect(stub.ask).toHaveBeenCalledOnce()
-
-    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    expect(fresh.globalState().entries.skill['m1']?.content).toBe('learned')
-  })
-})
 
 describe('governance config defaults', () => {
   it('wires the default file log into the harness root with mode 0600', async () => {
@@ -360,41 +268,6 @@ describe('governance config defaults', () => {
     expect(existsSync(join(home, PLUGIN_LOG_FILE_NAME))).toBe(false)
   })
 
-  it('enforces the default maxEntryGrowth cap on a global update through the tool', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-
-    // Seed a one-character global skill entry through the shared store file.
-    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    seeder.applyRefinement(stubAgent('growth-seeder').agent, {
-      id: 'refine_seed_growth',
-      summary: 'seed a one-character skill',
-      edits: [{ action: 'create', kind: 'skill', id: 'seed', blastRadius: 'project', content: 'x' }],
-    }, { global: true })
-
-    // The plan carries a reason so validation passes and only the growth rule
-    // fires: 20 chars vs 1 is a 19x growth, far beyond the default 0.5 cap.
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_growth',
-      summary: 'grow the seeded entry',
-      edits: [{ action: 'update', kind: 'skill', id: 'seed', blastRadius: 'project', content: 'a'.repeat(20), reason: 'grow it' }],
-    }) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const result = await execute(ctx, 'harness_refine', {}, stubAgent('growth-executor').agent)
-    const json = resultJson(result)
-    expect(json.applied).toBe(0)
-    expect(json.failed).toBe(1)
-    const edit = (json.edits as Array<Record<string, unknown>>)[0]
-    expect(edit).toMatchObject({ action: 'update', kind: 'skill', id: 'seed', blastRadius: 'project', applied: false })
-    expect(edit?.error).toBe('entry growth exceeds the maxEntryGrowth cap')
-
-    const fresh = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    expect(fresh.globalState().entries.skill['seed']?.content).toBe('x')
-  })
 })
 
 describe('optional refine command capability', () => {
@@ -875,228 +748,32 @@ describe('isHarnessStateSource across the source-kind migration', () => {
   })
 })
 
-describe('skill bundle acceptance', () => {
-  it('restores and clears bundle files on rollback of a create', async () => {
-    const home = tempHome()
-    const ctx = new Context()
+
+
+
+// Production no longer performs planner/apply/post-apply operations inside this plugin.
+// Those library semantics are covered by coordinator/store suites; the live adapter
+// must fail closed when the ordinary Evolution control plane is unavailable.
+describe('manual Dream control plane', () => {
+  it.each([
+    { global: true },
+    { global: false },
+    { rollback_id: 'legacy-refinement' },
+    { instructions: 'save this workflow', cross_session: true },
+  ])('never writes assets or calls the planner without Evolution: %j', async args => {
+    const home = tempHome(), ctx = new Context(), llm = makePlanLlm(PLAN)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_bundle',
-      summary: 'create a bundle skill',
-      edits: [{
-        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
-        description: 'Use whenever bundling',
-        content: '## Steps\n1. Run `scripts/bundle.py`',
-        files: { 'scripts/bundle.py': 'print(1)' },
-      }],
-    }) as never)
+    ctx.provide('llm', llm as never)
     await ctx.plugin(plugin, pluginConfig(home))
-
-    const created = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent))
-    expect(created.applied).toBe(1)
-    expect(existsSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'))).toBe(true)
-    expect(readFileSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'), 'utf8')).toBe('print(1)')
-    const skillMd = readFileSync(join(home, 'skills', 'bundle-demo', 'SKILL.md'), 'utf8')
-    expect(skillMd).toContain('dsh-continual-harness')
-    expect(skillMd).toContain('esp')
-
-    // roll back the create without an LLM
-    const rolled = resultJson(await execute(ctx, 'harness_refine', { rollback_id: 'refine_bundle' }, stubAgent('executor').agent))
-    expect(rolled.applied).toBe(1)
-    expect(existsSync(join(home, 'skills', 'bundle-demo'))).toBe(false)
-  })
-
-  it('never touches a non-harness-owned bundle during create', async () => {
-    const home = tempHome()
-    mkdirSync(join(home, 'skills', 'mine'), { recursive: true })
-    writeFileSync(join(home, 'skills', 'mine', 'SKILL.md'), '---\nname: mine\n---\nuser skill')
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_take',
-      summary: 'try to take a user name',
-      edits: [{ action: 'create', kind: 'skill', id: 'mine', blastRadius: 'project', content: 'body' }],
-    }) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const result = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent))
-    expect(result.failed).toBe(1)
-    const edit = (result.edits as Array<Record<string, unknown>>).find(entry => entry.id === 'mine')
-    expect(String(edit?.error)).toContain('not harness-owned')
-    expect(readFileSync(join(home, 'skills', 'mine', 'SKILL.md'), 'utf8')).toBe('---\nname: mine\n---\nuser skill')
-  })
-})
-
-describe('post-apply diagnostics wiring', () => {
-  it('attaches a completed diagnostics report to tool output by default', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm(PLAN) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-on').agent))
-    expect(json).toMatchObject({ applied: 1, failed: 0, refinement_id: 'refine_appr' })
-    expect(json.diagnostics).toMatchObject({ status: 'completed', structural: [], security: [], errors: [] })
-  })
-
-  it('omits diagnostics entirely when diagnosticsEnabled is false', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm(PLAN) as never)
-    await ctx.plugin(plugin, { ...pluginConfig(home), diagnosticsEnabled: false })
-
-    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-off').agent))
-    expect(json.applied).toBe(1)
-    expect(json.diagnostics).toBeUndefined()
-  })
-
-  it('reports security issues from the local provider when securityEnabled is true', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_secret',
-      summary: 'create a skill with a secret',
-      edits: [{
-        action: 'create', kind: 'skill', id: 'secret-demo', blastRadius: 'project',
-        description: 'Use whenever handling tokens',
-        content: '## Steps\n1. Call the API with ' + ('sk-' + 'abcdef1234567890abcdef1234567890'),
-      }],
-    }) as never)
-    await ctx.plugin(plugin, { ...pluginConfig(home), securityEnabled: true })
-
-    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-sec').agent))
-    expect(json.applied).toBe(1)
-    const diagnostics = json.diagnostics as { status: string; security: Array<Record<string, unknown>> }
-    expect(diagnostics.status).toBe('completed')
-    const issue = diagnostics.security.find(finding => finding.skill_id === 'secret-demo')
-    expect(issue?.code).toBe('secret-exposure')
-    expect(issue?.severity).toBe('high')
-  })
-
-  it('does not invoke the security provider when securityEnabled is false', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    // The same credential-like body the securityEnabled: true test flags must
-    // produce no finding here: securityEnabled gates the provider at runner
-    // construction, so the local provider is never wired in to run.
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_secret_off',
-      summary: 'create a skill with a secret',
-      edits: [{
-        action: 'create', kind: 'skill', id: 'secret-demo-off', blastRadius: 'project',
-        description: 'Use whenever handling tokens',
-        content: '## Steps\n1. Call the API with ' + ('sk-' + 'abcdef1234567890abcdef1234567890'),
-      }],
-    }) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const json = resultJson(await execute(ctx, 'harness_refine', { global: true }, stubAgent('diag-sec-off').agent))
-    expect(json.applied).toBe(1)
-    const diagnostics = json.diagnostics as { status: string; security: Array<Record<string, unknown>> }
-    expect(diagnostics.status).toBe('completed')
-    expect(diagnostics.security).toEqual([])
-  })
-})
-
-describe('harness_refine bundle materialization result', () => {
-  it('reports materialization status and writes the bundle files', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_bundle',
-      summary: 'create a bundle skill',
-      edits: [{
-        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
-        description: 'Use whenever bundling',
-        content: '## Steps\n1. Run `scripts/bundle.py`',
-        files: { 'scripts/bundle.py': 'print(1)', 'references/t.md': '# t' },
-      }],
-    }) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent)
-    const json = resultJson(result)
-    expect(json.applied).toBe(1)
-    const materialization = json.materialization as {
-      status: string
-      written: string[]
-      unchanged: string[]
-      skipped: string[]
-      removed: string[]
-      errors: unknown[]
-    }
-    expect(materialization).toEqual({
-      status: 'completed',
-      written: [
-        join(home, 'skills', 'bundle-demo', 'SKILL.md'),
-        join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'),
-        join(home, 'skills', 'bundle-demo', 'references', 't.md'),
-      ],
-      unchanged: [],
-      skipped: [],
-      removed: [],
-      errors: [],
-    })
-    expect(existsSync(join(home, 'skills', 'bundle-demo', 'SKILL.md'))).toBe(true)
-    expect(readFileSync(join(home, 'skills', 'bundle-demo', 'scripts', 'bundle.py'), 'utf8')).toBe('print(1)')
-  })
-
-  it('deletes a user-added file from an owned bundle on the next update', async () => {
-    const home = tempHome()
-    const ctx = new Context()
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(AgentRegistry)
-    await ctx.plugin(ToolRuntime)
-    // seed the owned bundle through the store (an update plan cannot create a
-    // missing entry), then drop a foreign file into it
-    const seeder = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
-    seeder.applyRefinement(stubAgent('seed-executor').agent, {
-      id: 'refine_seed_bundle',
-      summary: 'create a bundle skill',
-      edits: [{
-        action: 'create', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
-        description: 'Use whenever bundling',
-        content: '## Steps\n1. Run `scripts/bundle.py`',
-        files: { 'scripts/bundle.py': 'print(1)' },
-      }],
-    }, { global: true })
-    writeFileSync(join(home, 'skills', 'bundle-demo', 'notes.md'), 'manual notes')
-    ctx.provide('llm', makePlanLlm({
-      id: 'refine_bundle_update',
-      summary: 'update the bundle skill',
-      edits: [{
-        action: 'update', kind: 'skill', id: 'bundle-demo', blastRadius: 'project',
-        description: 'Use whenever bundling',
-        content: '## Steps\n1. Run `scripts/bundle.py`',
-        files: { 'scripts/bundle.py': 'print(2)' },
-        reason: 'bump the script',
-      }],
-    }) as never)
-    await ctx.plugin(plugin, pluginConfig(home))
-
-    const result = await execute(ctx, 'harness_refine', { global: true }, stubAgent('executor').agent)
-    const json = resultJson(result)
-    const materialization = json.materialization as { removed: string[] }
-    expect(materialization.removed).toEqual([join(home, 'skills', 'bundle-demo', 'notes.md')])
-    expect(existsSync(join(home, 'skills', 'bundle-demo', 'notes.md'))).toBe(false)
+    const json = resultJson(await execute(ctx, 'harness_refine', args, stubAgent('manual-gate').agent))
+    expect(json.refinement_id).toBe('none')
+    expect(json.applied).toBe(0)
+    expect(json.summary).toContain('DSH_HOME')
+    expect(llm.callCount).toBe(0)
+    const store = new HarnessStore(new Context(), { harnessRoot: home, skillsDir: join(home, 'skills') })
+    expect(store.globalState().entries.skill).toEqual({})
+    expect(existsSync(join(home, 'skills', 'm1'))).toBe(false)
   })
 })

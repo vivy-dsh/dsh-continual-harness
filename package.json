@@ -19,6 +19,8 @@
     }
   },
   "exports": {
+    "./internal-ipc": { "types": "./internal-ipc.d.mts", "default": "./internal-ipc.mjs" },
+    "./skill-owner": { "types": "./lib/types/skill-owner.d.ts", "default": "./lib/types/skill-owner.js" },
     ".": {
       "types": "./lib/types/index.d.ts",
       "default": "./lib/types/index.js"
@@ -31,6 +33,8 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "internal-ipc.mjs",
+    "internal-ipc.d.mts",
     "cordis.patch.yml",
     "lib/types/**/*",
     "scripts/backfill-project-tags.mjs",

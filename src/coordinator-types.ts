@@ -12,6 +12,7 @@ import type { OwnerCandidateReport } from './owner-candidates.ts'
 import type { HostRequestRegistry } from './request-snapshot.ts'
 import type { PlannerPrefixCacheMode } from './cache-detect.ts'
 import type { HarnessStore } from './store.ts'
+import type { SkillOwner } from './skill-owner.ts'
 import type { DiagnosticRunner } from './diagnostics.ts'
 import type {
   AutoRefineReason,
@@ -29,6 +30,9 @@ export type PlanRequest = {
   instructions?: string
   /** Superagent ticket that owns the refinement, so cross-domain candidates have a home. */
   ticketId?: string
+  subjectId?: string
+  evidenceRefs?: unknown[]
+  crossSession?: boolean
   signal?: AbortSignal
 }
 
@@ -71,6 +75,7 @@ export type RefineErrorCode =
   | 'unexpected-error'
 
 export interface RefineExecutionResult {
+  dreamRequest?: { id?: string; status?: string; inputId?: string; skipped?: boolean; reason?: string }
   commitStatus: CommitStatus
   approval: 'not-required' | 'approved' | 'rejected'
   appliedCount: number
@@ -89,6 +94,7 @@ export interface RefineCoordinator {
 }
 
 export interface RefineCoordinatorOptions {
+  skillOwner?: SkillOwner
   store: HarnessStore
   completeFor: (agent: Agent) => Complete
   maxTrajectoryChars?: number

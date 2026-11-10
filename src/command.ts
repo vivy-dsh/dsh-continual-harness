@@ -91,7 +91,7 @@ export interface CommandsCapability {
 
 /** Parser output for one validated `/refine` invocation. */
 export type ParsedRefineCommand =
-  | { mode: 'plan'; scope: 'local' | 'global'; instructions?: string }
+  | { mode: 'plan'; scope: 'local' | 'global'; instructions?: string; crossSession?: boolean }
   | { mode: 'rollback'; scope: 'local' | 'global'; rollbackId: string }
 
 const SCOPE_FLAGS = ['--global', '--local'] as const
@@ -111,10 +111,13 @@ function stripRefineToken(rawInput: string): string {
 }
 
 function parsePlan(tokens: string[], defaultGlobal: boolean): ParsedRefineCommand | { error: string } {
+  let crossSession = false
   let scope: 'local' | 'global' | undefined
   const focus: string[] = []
   for (const token of tokens) {
-    if (isScopeFlag(token)) {
+    if (token === '--cross-session') {
+      crossSession = true
+    } else if (isScopeFlag(token)) {
       if (scope !== undefined) return { error: `duplicate scope flag ${token}` }
       scope = scopeOf(token)
     } else if (token.startsWith('--')) {
@@ -125,6 +128,7 @@ function parsePlan(tokens: string[], defaultGlobal: boolean): ParsedRefineComman
   }
   const result: ParsedRefineCommand = { mode: 'plan', scope: scope ?? (defaultGlobal ? 'global' : 'local') }
   if (focus.length > 0) result.instructions = focus.join(' ')
+  if (crossSession) result.crossSession = true
   return result
 }
 
@@ -228,6 +232,7 @@ export function createRefineCommandAdapter(
           scope: parsed.scope,
           source: 'command',
           ...(parsed.instructions === undefined ? {} : { instructions: parsed.instructions }),
+          ...(parsed.crossSession === true ? { crossSession: true } : {}),
         }
       : {
           mode: 'rollback',
