@@ -318,7 +318,7 @@ export class HarnessStore {
           const prior = target.entries.skill[edit.id] as import('./types.ts').SkillEntry | undefined
           if (edit.action === 'delete' || edit.archive === true) return 'skill deletion requires an owner publication'
           const entry = { ...prior, ...edit }
-          if (typeof entry.content !== 'string' || !this.skillOwner.matchesLive(edit.id, { content: entry.content, ...(entry.description === undefined ? {} : { description: entry.description }), ...(entry.files === undefined ? {} : { files: entry.files }) })) return 'skill candidate has not been validated and published by SkillOwner'
+          if (typeof entry.content !== 'string' || !this.skillOwner.matchesLive(edit.id, { content: entry.content, ...(entry.description === undefined ? {} : { description: entry.description }), ...(entry.files === undefined ? {} : { files: entry.files }) })) return 'skill candidate has not been approved and published by SkillOwner'
           return undefined
         }
         return edit.action === 'create' && edit.kind === 'skill' ? this.createConflictError(edit.id) : undefined

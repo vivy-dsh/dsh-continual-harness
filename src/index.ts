@@ -262,7 +262,7 @@ export function apply(ctx: Context, config: Config): void {
   const candidateHome = dshHome !== undefined && isAbsolute(dshHome) ? dshHome : undefined
   const skillOwner = candidateHome
     ? createRuntimeSkillOwner(ctx, candidateHome, config.skillsDir ?? dshHomePath('skills'))
-    : new SkillOwner(join(config.harnessRoot ?? defaultHarnessHome(), 'skill-owner'), async () => false, { skillsDir: config.skillsDir ?? dshHomePath('skills') })
+    : new SkillOwner(join(config.harnessRoot ?? defaultHarnessHome(), 'skill-owner'), { skillsDir: config.skillsDir ?? dshHomePath('skills') })
 
   const store = new HarnessStore(ctx, {
     skillOwner,

@@ -1,30 +1,32 @@
-# Skill Owner deployment
+# Skill Owner
 
-Skill Owner stores staged candidates, frozen suites, validation receipts and immutable versions under `$DSH_HOME/harness/skill-owner`. This directory must not be a filesystem skill discovery root. The `harness-owner` provider exposes only committed versions and pins each loaded instruction body and resource directory to its digest. Existing global harness skills migrate only when their on-disk bundle matches the stored entry byte-for-byte and bears both harness author/source markers. Other files are untouched.
+Skill Owner 保存暂存候选、人工决定与不可变版本，路径在 `$DSH_HOME/harness/skill-owner`。该目录不能是技能发现根。`harness-owner` provider 只暴露已发布版本，并把加载的指令正文与资源目录钉在对应摘要上。全局 harness 技能只有在磁盘 bundle 逐字节一致且带 harness author/source 标记时才迁移；其他文件不动。
 
-The provider uses rank 390: project and custom user roots retain their existing precedence, while managed versions supersede the default user-home filesystem copy (rank 400). A same-name skill in a higher-priority custom root can therefore shadow a managed version; publication does not override that user choice. Deployments using a custom root for legacy managed copies should check catalog precedence when migrating.
+provider 使用 rank 390：项目与自定义用户根保持各自既有优先级，托管版本覆盖默认用户目录副本（rank 400）。同名的高优先级自定义技能可以遮蔽托管版本，发布不会覆盖这个用户选择。
 
-Production `/refine` and `harness_refine` submit a manual request to Evolution. They do not invoke a separate planner or write skills directly. Evolution must authorize the live ordinary Superagent Ticket, subject, asset scope and frozen candidate entry digest at stage, validation and publication. The owner rechecks publication authorization after validation. Neither a caller `passed` flag nor an LLM benchmark score authorizes publication.
+## 发布权限是人工决定
 
-## Provision independent execution cases
+发布只需要一条记录在案的人工批准，不需要验证器、不需要 Docker，也没有 OCI 回退。任何 IPC 调用都不能代替人工批准：
 
-An administrator must provision `validation-suite.json` in the owner directory. No suite, an empty mandatory or holdout set, unavailable Docker daemon/image, or inconclusive results produce **blocked**. There is deliberately no generated default holdout suite: cases and answers must be independently authored for the deployment's skills and unavailable to the candidate author during planning.
+- 暂存走组件通道 `POST /dsh-harness/internal/candidates`，由 `dsh-evolution` 校验调用方持有运行中 Ticket、subject 与冻结计划里的同一份 entry 摘要后转交。
+- 批准只走面板 `POST /dsh-continual-harness/api/decide`：要求同源、回环、JSON、宿主会话通过 `connection.requestRejection`、显式 `confirm: true`，并带上审阅时的 bundle 摘要。
+- 组件通道里的 `/status` 是只读的，用于 Dream 读取当前 live 版本。
 
-```json
-{
-  "policyVersion": "deployment-policy-1",
-  "image": "registry.example/skill-evaluator@sha256:<64 hexadecimal digest>",
-  "platform": "linux",
-  "timeoutMs": 30000,
-  "mandatory": [{ "id": "script-execution", "command": ["/trusted/check-execution"] }],
-  "holdout": [{ "id": "independent-fixture", "command": ["/trusted/check-holdout"] }]
-}
-```
+批准记录包含 `candidateId`、`decision`（`approved` / `rejected`）、`bundleDigest`、`decidedAt` 与 `actor: 'panel'`。一个候选只有一条决定：重复提交同一决定是幂等的，改判会被拒绝，必须走新候选。一次批准只能产生一次发布；发布记录保存决定的摘要，数据库替换（决定引用 + 幂等映射 + live 指针）是原子的。
 
-The image must already be locally installed. Package trusted evaluators and frozen fixtures in that image; commands receive the candidate (or baseline) at `/skill`, a private writable `/output`, and private `/tmp`. Each command must print exactly one JSON object on stdout: `{"completed":true,"score":1}`. Scores must be finite in `[0,1]`. Mandatory cases require score 1; every holdout runs against both the exact baseline and candidate and permits no score regression. New skills use an empty baseline. Statistical A/B reports remain optional diagnostics and are not publication gates.
+## 面板接口
 
-The default runner is Docker OCI only: a digest-pinned Linux image, read-only root and bundle mount, no network, no capabilities, non-root user, no inherited runtime credentials, bounded CPU/memory/PIDs/output/time, and private tmpfs output. There is no host-shell fallback. Windows-specific cases need a separately configured matching isolated runner; an unavailable matching environment must remain blocked. Administrators own suite/image provisioning and must prevent candidate authors from changing this trusted configuration. Host file access under the same unrestricted OS account is not a security boundary.
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/dsh-continual-harness/api/pending` | 待审候选（含正文、附件清单、摘要）与当前 live 版本 |
+| POST | `/dsh-continual-harness/api/decide` | `{candidateId, decision, expectedBundleDigest, confirm: true}`；批准即发布 |
 
-Receipts bind candidate, baseline, frozen suite, policy and environment digests and carry an owner-process HMAC. Receipts from a previous owner process must be revalidated after restart. Candidate bundles remain available for that revalidation. Publication commits its live pointer, publication receipt and idempotency lookup atomically; unknown-result callers query `/status` by idempotency key before retrying.
+`GET` 不受同源限制（便于面板初始化），`POST` 必须带 `origin`。缺宿主会话服务时接口 fail-closed 返回 503，不会退化成无鉴权写入。
 
-Internal authenticated component endpoints are POST `/candidates`, `/validate`, `/publish`, and `/status`. Owner publication receipts retain `skillId` and `publicationId` for the Evolution ledger. A rollback is another staged candidate targeting a prior immutable version's content and the current expected digest; it requires the same current authorization and validation as any update. Legacy direct deletion/rollback cannot bypass this gate.
+## 拒绝条件
+
+候选正文为空、超过 1 MiB、`files` 键不是 `scripts/` 或 `references/` 前缀的相对路径、正文引用的附件缺失、候选摘要被篡改、live 基线已前进、同名用户技能已存在——以上任一都拒绝，不写 live。
+
+回滚是另一个指向历史不可变版本的候选，需要同样的批准。删除走候选生命周期，不能直接改指针。
+
+自动验证环境（隔离执行器、测试套件、Python 工作台等）如何提供仍是待决策项，见 `TODOLIST.md` 的 DV-EV-014；本插件在决策前不引入新的运行时依赖。

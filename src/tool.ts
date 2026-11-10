@@ -19,7 +19,7 @@ import type { HarnessStore } from './store.ts'
 import type { DiagnosticReport, MaterializationResult } from './types.ts'
 import { suggestWrapup } from './wrapup.ts'
 
-const DESCRIPTION = 'Submit manual refinement only when the user explicitly asks to refine or save this session workflow as a skill. This queues an ordinary Superagent Input and Ticket through Evolution; it does not directly modify assets. Do not invoke autonomously after failures or successful tactics. Startup AutoDream owns automatic evolution. Skills activate only after owner-controlled execution and independent holdout validation; persona changes remain proposals. ActMem owns memory and Laputa owns persona. Defaults to evidence from the current session. Use cross_session only when the user explicitly requests cross-session refinement.'
+const DESCRIPTION = 'Submit manual refinement only when the user explicitly asks to refine or save this session workflow as a skill. This queues an ordinary Superagent Input and Ticket through Evolution; it does not directly modify assets. Do not invoke autonomously after failures or successful tactics. Startup AutoDream owns automatic evolution. Skills and persona changes become owner candidates that stay inert until the user approves them in its panel; there is no automatic publication. ActMem owns memory and Laputa owns persona. Defaults to evidence from the current session. Use cross_session only when the user explicitly requests cross-session refinement.'
 
 /** Tool-facing options resolved by the plugin. */
 export interface ToolOptions {

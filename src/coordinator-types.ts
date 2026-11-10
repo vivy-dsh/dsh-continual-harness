@@ -72,12 +72,13 @@ export type RefineErrorCode =
   | 'commit-failed'
   | 'materialization-failed'
   | 'diagnostics-failed'
+  | 'human-approval-required'
   | 'unexpected-error'
 
 export interface RefineExecutionResult {
   dreamRequest?: { id?: string; status?: string; inputId?: string; skipped?: boolean; reason?: string }
   commitStatus: CommitStatus
-  approval: 'not-required' | 'approved' | 'rejected'
+  approval: 'not-required' | 'approved' | 'rejected' | 'pending'
   appliedCount: number
   rejectedCount: number
   refinement?: RefinementResult

@@ -408,11 +408,10 @@ export function createRefineCoordinator(options: RefineCoordinatorOptions): Refi
             const entry = { ...prior, ...edit }
             if (typeof entry.content !== 'string') return errorResult('validation', 'invalid-proposal', 'Skill candidate body is missing', approval)
             try {
+              // Staging is the end of this path: a live skill needs a human
+              // decision recorded by the owner panel, never an automatic commit.
               const candidate = options.skillOwner.stageCandidate({ skillId: edit.id, entry: { content: entry.content, ...(entry.description === undefined ? {} : { description: entry.description }), ...(entry.files === undefined ? {} : { files: entry.files }) }, expectedDigest: options.skillOwner.currentDigest(edit.id), subjectId: request.subjectId, ticketId: request.ticketId, evidenceRefs: request.evidenceRefs, idempotencyKey: `refine:${proposal.id}:${edit.id}` })
-              const validation = await options.skillOwner.validateCandidate(candidate.candidateId)
-              if (validation.status !== 'passed' || !validation.receiptId) return errorResult('validation', 'invalid-proposal', `Skill candidate ${candidate.candidateId} ${validation.status}: ${validation.reason ?? 'validation incomplete'}`, approval)
-              if (request.signal?.aborted) return errorResult('commit', 'aborted', 'refinement request aborted', approval)
-              await options.skillOwner.publishCandidate({ candidateId: candidate.candidateId, receiptId: validation.receiptId, idempotencyKey: `refine:${proposal.id}:${edit.id}`, subjectId: request.subjectId, ticketId: request.ticketId })
+              return errorResult('approval', 'human-approval-required', `Skill candidate ${candidate.candidateId} is staged for human review; approve it in the evolution panel`, 'pending')
             } catch (error) { return errorResult('validation', 'invalid-proposal', error instanceof Error ? error.message : String(error), approval) }
           }
         }
