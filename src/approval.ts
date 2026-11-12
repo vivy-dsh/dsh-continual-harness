@@ -39,6 +39,11 @@ export function questionServiceOf(ctx: Context): QuestionService | undefined {
 
 /**
  * Require explicit human approval before a global store write commits.
+ *
+ * Unreachable in production today: the coordinator only calls it when
+ * `requireGlobalApprovalForTool` is true, and nothing sets that flag. Kept with
+ * its tests as the conservative-mode seam.
+ *
  * @param ctx - context that may carry the user-questions service.
  * @param agent - the requesting agent; kept for signature parity, currently
  * unused by the local service contract.

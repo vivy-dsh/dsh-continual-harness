@@ -12,16 +12,19 @@ provider 使用 rank 390：项目与自定义用户根保持各自既有优先�
 - 批准只走面板 `POST /dsh-continual-harness/api/decide`：要求同源、回环、JSON、宿主会话通过 `connection.requestRejection`、显式 `confirm: true`，并带上审阅时的 bundle 摘要。
 - 组件通道里的 `/status` 是只读的，用于 Dream 读取当前 live 版本。
 
-批准记录包含 `candidateId`、`decision`（`approved` / `rejected`）、`bundleDigest`、`decidedAt` 与 `actor: 'panel'`。一个候选只有一条决定：重复提交同一决定是幂等的，改判会被拒绝，必须走新候选。一次批准只能产生一次发布；发布记录保存决定的摘要，数据库替换（决定引用 + 幂等映射 + live 指针）是原子的。
+批准记录包含 `candidateId`、`decision`（`approved` / `rejected`）、`bundleDigest`、`decidedAt`、`actor: 'panel'`，批准时还有 `publicationId`。一个候选只有一条决定：重复提交同一决定是幂等的，改判会被拒绝，必须走新候选。一次批准只能产生一次发布。
+
+批准与发布是一次提交：`decideAndPublish` 先在锁内完成基线 CAS、写入不可变版本目录和 owner-state（决定引用 + 幂等映射 + live 指针一次原子替换），成功后才写不可变的批准回执。发布失败时不留下任何决定，候选仍在 `pending()`；回执丢失时 `decision()` 从 publication 反推，重放同一请求返回同一条发布，不会重复发布。
 
 ## 面板接口
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/dsh-continual-harness/api/pending` | 待审候选（含正文、附件清单、摘要）与当前 live 版本 |
+| GET | `/dsh-continual-harness/api/pending` | `{pending, decided, live}`：待审候选（含渲染后的 `bundle`、`baselineBundle`、ticket/subject/证据引用）与已处置历史 |
 | POST | `/dsh-continual-harness/api/decide` | `{candidateId, decision, expectedBundleDigest, confirm: true}`；批准即发布 |
+| POST | `/dsh-continual-harness/api/rollback` | `{skillId, confirm: true}`；以 live 的上一版生成回滚候选，不发布 |
 
-`GET` 不受同源限制（便于面板初始化），`POST` 必须带 `origin`。缺宿主会话服务时接口 fail-closed 返回 503，不会退化成无鉴权写入。
+`GET` 不受同源限制（便于面板初始化），`POST` 必须带 `origin`。缺宿主会话服务时接口 fail-closed 返回 503，不会退化成无鉴权写入。响应体超过 4 MiB 时服务端会省略最旧候选的正文并标记 `truncated: true`。
 
 ## 拒绝条件
 

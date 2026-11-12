@@ -113,4 +113,39 @@ describe('skill review panel', () => {
     expect((await call('POST', '/other', { candidateId: candidate.candidateId }, ORIGIN)).status).toBe(404)
     expect(owner.pending()).toHaveLength(1)
   })
+
+  it('keeps decided candidates visible and keeps a failed publication in the review queue', async () => {
+    const { owner, candidate, call } = fixture()
+    // Staged against "no live version"; approving the first candidate makes this one stale.
+    const stale = owner.stageCandidate({ ...INPUT, entry: { content: 'Stale procedure.' }, idempotencyKey: 'candidate-two' })
+    const body = { candidateId: candidate.candidateId, decision: 'approved', expectedBundleDigest: candidate.bundleDigest, confirm: true }
+    expect((await call('POST', '/decide', body, ORIGIN)).status).toBe(200)
+    expect((await call('POST', '/decide', { ...body, decision: 'rejected' }, ORIGIN)).status).toBe(422)
+    const settled = await call('GET', '/pending')
+    expect(settled.body.pending.map((item: { candidateId: string }) => item.candidateId)).toEqual([stale.candidateId])
+    expect(settled.body.decided[0]).toMatchObject({ candidateId: candidate.candidateId, decision: 'approved', publication: { version: 1 } })
+
+    // Approving the stale candidate must not strand it: no decision, still pending.
+    const refused = await call('POST', '/decide', { candidateId: stale.candidateId, decision: 'approved', expectedBundleDigest: stale.bundleDigest, confirm: true }, ORIGIN)
+    expect(refused.status).toBe(422)
+    expect((await call('GET', '/pending')).body.pending).toEqual([expect.objectContaining({ candidateId: stale.candidateId, bundle: [expect.objectContaining({ name: 'SKILL.md' })] })])
+  })
+
+  it('turns a rollback click into another candidate, never a direct publication', async () => {
+    const { owner, candidate, call } = fixture()
+    const body = { candidateId: candidate.candidateId, decision: 'approved', expectedBundleDigest: candidate.bundleDigest, confirm: true }
+    await call('POST', '/decide', body, ORIGIN)
+    const first = (owner.status({}) as { bundleDigest: string }[])[0]!
+    const second = owner.stageCandidate({ ...INPUT, expectedDigest: first.bundleDigest, entry: { content: 'Second procedure.' }, idempotencyKey: 'candidate-two' })
+    await call('POST', '/decide', { candidateId: second.candidateId, decision: 'approved', expectedBundleDigest: second.bundleDigest, confirm: true }, ORIGIN)
+    expect((owner.status({}) as { version: number }[])[0]!.version).toBe(2)
+
+    const reply = await call('POST', '/rollback', { skillId: 'reviewed-skill', confirm: true }, ORIGIN)
+    expect(reply.status).toBe(200)
+    expect(reply.body.candidate).toMatchObject({ skillId: 'reviewed-skill', rollbackOf: expect.any(String) })
+    expect((owner.status({}) as { version: number }[])[0]!.version).toBe(2)
+    expect((await call('GET', '/pending')).body.pending.map((item: { candidateId: string }) => item.candidateId)).toContain(reply.body.candidate.candidateId)
+    // No previous version, no rollback candidate.
+    expect((await call('POST', '/rollback', { skillId: 'other-skill', confirm: true }, ORIGIN)).status).toBe(422)
+  })
 })

@@ -9,7 +9,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
-import type { DecisionKind, SkillOwner } from './skill-owner.ts'
+import type { SkillOwner } from './skill-owner.ts'
 
 /** Route prefix served by the DSH web server. */
 export const PANEL_PREFIX = '/dsh-continual-harness/api'
@@ -27,6 +27,21 @@ interface PanelWebServer {
 interface PanelConnection { requestRejection(req: IncomingMessage): unknown }
 
 const BODY_LIMIT = 64 * 1024
+const PENDING_BYTES_LIMIT = 4 * 1024 * 1024
+
+function pendingPayload(owner: SkillOwner) {
+  // Newest first, so a large inbox drops the oldest bodies instead of the one being reviewed.
+  const pending = owner.pending().sort((a, b) => b.stagedAt.localeCompare(a.stagedAt))
+  const decided = owner.decisions()
+  const live = owner.status({})
+  let budget = PENDING_BYTES_LIMIT - JSON.stringify({ pending: [], decided, live }).length
+  const trimmed = pending.map(item => {
+    const cost = JSON.stringify(item.bundle).length + JSON.stringify(item.baselineBundle).length
+    if (cost <= budget) { budget -= cost; return item }
+    return { ...item, bundle: item.bundle.map(file => ({ name: file.name, content: '' })), baselineBundle: null, truncated: true }
+  })
+  return { pending: trimmed, decided, live }
+}
 
 function send(res: ServerResponse, status: number, value: unknown): void {
   if (res.writableEnded || res.destroyed) return
@@ -90,7 +105,7 @@ export function registerSkillOwnerPanel(ctx: Context, owner: SkillOwner): () => 
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       try {
         if (url.pathname === `${PANEL_PREFIX}/pending` && req.method === 'GET') {
-          return send(res, 200, { ok: true, pending: owner.pending(), live: owner.status({}) })
+          return send(res, 200, { ok: true, ...pendingPayload(owner) })
         }
         if (url.pathname === `${PANEL_PREFIX}/decide` && req.method === 'POST') {
           if (req.headers.origin === undefined) return failure(res, 403, 'HUMAN_REVIEW_REQUIRED', '请从已登录的面板确认候选', '打开进化面板的技能候选页审阅')
@@ -103,11 +118,31 @@ export function registerSkillOwnerPanel(ctx: Context, owner: SkillOwner): () => 
           if (!candidateId || (decision !== 'approved' && decision !== 'rejected') || body.confirm !== true || typeof body.expectedBundleDigest !== 'string') {
             return failure(res, 400, 'INVALID_REQUEST', '需要候选 ID、明确的决定、审阅摘要与确认标记', '重新审阅候选内容后确认')
           }
-          const decided = owner.decide({ candidateId, decision: decision as DecisionKind, confirm: true, expectedBundleDigest: body.expectedBundleDigest })
-          if (decided.decision !== 'approved') return send(res, 200, { ok: true, decision: decided, publication: null })
           const candidate = owner.status({ candidateId }) as { subjectId: string }
-          const publication = owner.publishCandidate({ candidateId, idempotencyKey: `panel:${candidateId}`, subjectId: candidate.subjectId })
-          return send(res, 200, { ok: true, decision: decided, publication })
+          // One click, one commit: a failed publication records nothing and the candidate stays pending.
+          const decided = owner.decideAndPublish({
+            candidateId, decision, confirm: true, expectedBundleDigest: body.expectedBundleDigest,
+            idempotencyKey: `panel:${candidateId}`, subjectId: candidate.subjectId,
+          })
+          return send(res, 200, { ok: true, decision: decided.decision, publication: decided.publication })
+        }
+        if (url.pathname === `${PANEL_PREFIX}/rollback` && req.method === 'POST') {
+          if (req.headers.origin === undefined) return failure(res, 403, 'HUMAN_REVIEW_REQUIRED', '请从已登录的面板发起回滚', '打开进化面板的技能候选页')
+          if (!String(req.headers['content-type'] ?? '').toLowerCase().includes('application/json')) {
+            return failure(res, 415, 'JSON_REQUIRED', '请求必须使用 JSON', '刷新页面后重试')
+          }
+          const body = await readBody(req)
+          const skillId = typeof body.skillId === 'string' ? body.skillId : ''
+          if (!skillId || body.confirm !== true) return failure(res, 400, 'INVALID_REQUEST', '需要技能 ID 与明确确认', '从已发布列表选择要回滚的技能')
+          const current = owner.currentDigest(skillId)
+          const previous = owner.previousPublication(skillId)
+          if (!current || !previous) return failure(res, 422, 'ROLLBACK_UNAVAILABLE', '没有可回滚的更早版本', '一个技能至少发布过两个版本才能回滚')
+          const source = owner.status({ candidateId: previous.candidateId }) as { subjectId: string; ticketId: string; evidenceRefs: unknown[] }
+          const candidate = owner.stageRollback({
+            skillId, expectedDigest: current, subjectId: source.subjectId, ticketId: source.ticketId,
+            evidenceRefs: source.evidenceRefs, idempotencyKey: `rollback:${previous.publicationId}`, rollbackOf: previous.publicationId,
+          })
+          return send(res, 200, { ok: true, candidate, previous: { version: previous.version, publicationId: previous.publicationId } })
         }
         return failure(res, 404, 'NOT_FOUND', '未知接口', '刷新页面后重试')
       } catch (error) {

@@ -15,7 +15,7 @@ export function createRuntimeSkillOwner(ctx: Context, home: string, skillsDir: s
   const owner = new SkillOwner(join(home, 'harness', 'skill-owner'), { skillsDir })
   const authorize = async (request: { ticketId: string; subjectId: string; skillId: string }, scope: string) => {
     const input = request as SkillCandidateInput
-    const result = await callComponent({ home, name: 'evolution', path: '/dream/authorize', body: { ticketId: input.ticketId, subjectId: input.subjectId, skillId: input.skillId, entryDigest: assetDigest(input.entry), expectedDigest: input.expectedDigest, evidenceRefs: input.evidenceRefs, scope } })
+    const result = await callComponent({ home, name: 'evolution', path: '/dream/authorize', body: { ticketId: input.ticketId, subjectId: input.subjectId, ...(input.requestId ? { requestId: input.requestId } : {}), skillId: input.skillId, entryDigest: assetDigest(input.entry), expectedDigest: input.expectedDigest, evidenceRefs: input.evidenceRefs, scope } })
     if (result?.authorized !== true) throw Object.assign(new Error('Live Superagent Ticket authorization is required'), { code: 'SKILL_TICKET_REQUIRED' })
   }
   ctx.inject(['skills'], inner => {

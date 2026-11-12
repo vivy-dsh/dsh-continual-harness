@@ -243,6 +243,10 @@ export interface OwnerCandidateHandoff {
  * to their owners. The hand-off never gates the refinement: a deferred or
  * unreachable Evolution leaves the candidate in the ledger and the execution
  * result untouched apart from the report attached to it.
+ *
+ * NOT WIRED: `src/index.ts` never calls this, so the Evolution record store sees
+ * no rows from the refine path. Kept (with tests) as the prepared integration
+ * point rather than deleting a designed seam; see TODOLIST DV-EV-017.
  */
 export function decorateWithOwnerCandidates(inner: RefineCoordinator, handoff: OwnerCandidateHandoff): RefineCoordinator {
   // The plugin load is the one moment a stranded candidate is known to be

@@ -118,4 +118,63 @@ describe('immutable SkillOwner gate', () => {
   it('keeps canonical digest order independent of key order', () => {
     expect(assetDigest({ b: 2, a: 1 })).toBe(assetDigest({ a: 1, b: 2 }))
   })
+  it('commits the publication and the decision together, so a failed publish records nothing', () => {
+    const { owner, input } = fixture()
+    const first = owner.stageCandidate(input)
+    const second = owner.stageCandidate({ ...input, entry: { content: 'Second procedure.' }, idempotencyKey: 'candidate-two' })
+    const approved = owner.decideAndPublish({
+      candidateId: first.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: first.bundleDigest,
+      idempotencyKey: `panel:${first.candidateId}`, subjectId: input.subjectId,
+    })
+    expect(approved.publication).toMatchObject({ skillId: 'test-skill', version: 1 })
+    expect(approved.decision).toMatchObject({ candidateId: first.candidateId, decision: 'approved' })
+    // The second candidate was staged against "no live version"; the first approval made it stale.
+    expect(() => owner.decideAndPublish({
+      candidateId: second.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: second.bundleDigest,
+      idempotencyKey: `panel:${second.candidateId}`, subjectId: input.subjectId,
+    })).toThrow('baseline conflict')
+    expect(owner.decision(second.candidateId)).toBeNull()
+    expect(owner.pending().map(item => item.candidateId)).toContain(second.candidateId)
+  })
+  it('rebuilds a lost decision receipt from the publication instead of publishing twice', () => {
+    const { owner, input } = fixture()
+    const candidate = owner.stageCandidate(input)
+    const args = { candidateId: candidate.candidateId, decision: 'approved' as const, confirm: true, expectedBundleDigest: candidate.bundleDigest, idempotencyKey: `panel:${candidate.candidateId}`, subjectId: input.subjectId }
+    const first = owner.decideAndPublish(args)
+    rmSync(join(owner.root, 'decisions', `${candidate.candidateId}.json`))
+    const replay = owner.decideAndPublish(args)
+    expect(replay.publication?.publicationId).toBe(first.publication!.publicationId)
+    expect(replay.decision.decision).toBe('approved')
+    expect((owner.status({}) as unknown[]).length).toBe(1)
+  })
+  it('lists decided candidates with the publication they produced, including rejected alone', () => {
+    const { owner, input } = fixture()
+    const approved = owner.stageCandidate(input)
+    const rejected = owner.stageCandidate({ ...input, entry: { content: 'Rejected procedure.' }, idempotencyKey: 'candidate-two' })
+    owner.decideAndPublish({ candidateId: approved.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: approved.bundleDigest, idempotencyKey: `panel:${approved.candidateId}`, subjectId: input.subjectId })
+    owner.decideAndPublish({ candidateId: rejected.candidateId, decision: 'rejected', confirm: true, expectedBundleDigest: rejected.bundleDigest, idempotencyKey: `panel:${rejected.candidateId}`, subjectId: input.subjectId })
+    const history = owner.decisions()
+    expect(history.map(item => [item.decision, item.publication?.version ?? null])).toEqual(expect.arrayContaining([['approved', 1], ['rejected', null]]))
+    expect(owner.pending()).toEqual([])
+  })
+  it('shows the reviewer the rendered bundle, the baseline it changes, and where it came from', () => {
+    const { owner, input } = fixture()
+    const candidate = owner.stageCandidate(input)
+    const published = owner.decideAndPublish({ candidateId: candidate.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: candidate.bundleDigest, idempotencyKey: `panel:${candidate.candidateId}`, subjectId: input.subjectId })
+    owner.stageCandidate({ ...input, expectedDigest: published.publication!.bundleDigest, entry: { content: 'Updated procedure.', files: { 'scripts/run.sh': 'echo hi' } }, idempotencyKey: 'candidate-two' })
+    const pending = owner.pending().find(item => item.skillId === 'test-skill')!
+    expect(pending.bundle.map(file => file.name).sort()).toEqual(['SKILL.md', 'scripts/run.sh'])
+    expect(pending.baselineBundle?.map(file => file.name)).toEqual(['SKILL.md'])
+    expect(pending.ticketId).toBe('ticket-one')
+    expect(pending.subjectId).toBe('subject-one')
+    expect(pending.evidenceRefs[0]).toMatchObject({ sessionId: 's1', eventId: 'primary-e1' })
+  })
+  it('names the previous publication as the rollback target', () => {
+    const { owner, input } = fixture()
+    const first = owner.stageCandidate(input)
+    const published = owner.decideAndPublish({ candidateId: first.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: first.bundleDigest, idempotencyKey: `panel:${first.candidateId}`, subjectId: input.subjectId })
+    const second = owner.stageCandidate({ ...input, expectedDigest: published.publication!.bundleDigest, entry: { content: 'Updated procedure.' }, idempotencyKey: 'candidate-two' })
+    owner.decideAndPublish({ candidateId: second.candidateId, decision: 'approved', confirm: true, expectedBundleDigest: second.bundleDigest, idempotencyKey: `panel:${second.candidateId}`, subjectId: input.subjectId })
+    expect(owner.previousPublication('test-skill')?.publicationId).toBe(published.publication!.publicationId)
+  })
 })

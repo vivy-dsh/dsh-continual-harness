@@ -7,6 +7,8 @@ import { isHarnessOwnedBundle, referencedFilePaths, renderSkillMarkdown, validat
 export interface SkillAsset { content: string; description?: string; files?: Record<string, string> }
 export interface SkillCandidateInput {
   skillId: string; entry: SkillAsset; expectedDigest: string | null; subjectId: string; ticketId: string
+  /** The frozen Dream request this candidate belongs to; a Ticket may own several. */
+  requestId?: string
   evidenceRefs: unknown[]; idempotencyKey: string
   rollbackOf?: string
 }
@@ -17,16 +19,31 @@ export interface OwnerCandidate extends SkillCandidateInput {
 export type DecisionKind = 'approved' | 'rejected'
 export interface OwnerDecision {
   candidateId: string; decision: DecisionKind; bundleDigest: string; decidedAt: string; actor: 'panel'
+  /** The publication this approval produced; absent on a rejected candidate. */
+  publicationId?: string
 }
 export interface OwnerPublication {
   skillId: string; publicationId: string; version: number; bundleDigest: string; baselineDigest: string | null
   candidateId: string; decisionDigest: string; idempotencyKey: string
+  /** Set on every new publication; legacy rows fall back to the epoch. */
+  publishedAt?: string
   rollbackOf?: string
 }
+/** One file of a rendered skill bundle, for review and diffing. */
+export interface BundleFile { name: string; content: string }
 /** One staged candidate as a human reviewer sees it: the body is the review material. */
 export interface PendingCandidate {
-  candidateId: string; skillId: string; bundleDigest: string; baselineDigest: string | null
+  candidateId: string; skillId: string; subjectId: string; ticketId: string; evidenceRefs: Record<string, unknown>[]
+  bundleDigest: string; baselineDigest: string | null
   description: string; files: string[]; content: string; stagedAt: string
+  /** Rendered candidate bundle (`SKILL.md` + attachments) and the live baseline it was staged from. */
+  bundle: BundleFile[]; baselineBundle: BundleFile[] | null
+}
+/** One already-decided candidate and what it produced, for the reviewer's history. */
+export interface OwnerDecisionView {
+  candidateId: string; skillId: string; subjectId: string; ticketId: string
+  decision: DecisionKind; decidedAt: string; bundleDigest: string
+  publication: { publicationId: string; version: number } | null
 }
 export function assetDigest(value: unknown): string {
   const canonical = (v: unknown): unknown => Array.isArray(v) ? v.map(canonical)
@@ -114,7 +131,7 @@ export class SkillOwner {
           writeBundle(join(candidateDir, 'bundle'), files); immutable(join(candidateDir, 'candidate.json'), candidate)
           const versionDir = join(this.root, 'versions', bundleDigest)
           if (!existsSync(versionDir)) writeBundle(versionDir, files)
-          const publication: OwnerPublication = { skillId: entry.id, publicationId: randomUUID(), version: 1, bundleDigest, baselineDigest: null, candidateId: candidate.candidateId, decisionDigest: 'legacy-adopted', idempotencyKey: candidate.idempotencyKey }
+          const publication: OwnerPublication = { skillId: entry.id, publicationId: randomUUID(), version: 1, bundleDigest, baselineDigest: null, candidateId: candidate.candidateId, decisionDigest: 'legacy-adopted', idempotencyKey: candidate.idempotencyKey, publishedAt: new Date(0).toISOString() }
           db.live[entry.id] = publication; db.publications[publication.publicationId] = publication
           migrated.push(entry.id)
         } catch { /* A malformed, changed, or user-owned bundle stays entirely untouched. */ }
@@ -139,10 +156,66 @@ export class SkillOwner {
   }
   bundleDir(candidateId: string): string { return join(this.root, 'candidates', fileId(candidateId), 'bundle') }
   private decisionFile(candidateId: string): string { return join(this.root, 'decisions', `${fileId(candidateId)}.json`) }
-  /** The recorded human decision, or null while the candidate still waits for review. */
+  private publicationFor(candidateId: string): OwnerPublication | null {
+    return Object.values(this.database().publications).find(item => item.candidateId === candidateId) ?? null
+  }
+  private bundleAt(digest: string): BundleFile[] | null {
+    const dir = join(this.root, 'versions', fileId(digest))
+    if (!existsSync(dir)) return null
+    try { return Object.entries(readBundle(dir)).map(([name, content]) => ({ name, content })) } catch { return null }
+  }
+  private compactRefs(refs: unknown[]): Record<string, unknown>[] {
+    const result: Record<string, unknown>[] = []
+    for (const ref of refs.slice(0, 20)) {
+      if (ref === null || typeof ref !== 'object' || Array.isArray(ref)) { result.push({ ref: String(ref) }); continue }
+      const source = ref as Record<string, unknown>, compact: Record<string, unknown> = {}
+      for (const key of ['id', 'sessionId', 'seq', 'role', 'at', 'eventId']) {
+        const value = source[key]
+        if (typeof value === 'string' || typeof value === 'number') compact[key] = value
+      }
+      result.push(compact)
+    }
+    return result
+  }
+  /** The recorded human decision. A lost receipt is rebuilt from the publication it produced. */
   decision(candidateId: string): OwnerDecision | null {
     const path = this.decisionFile(candidateId)
-    return existsSync(path) ? json<OwnerDecision>(path) : null
+    if (existsSync(path)) return json<OwnerDecision>(path)
+    const publication = this.publicationFor(fileId(candidateId))
+    if (!publication) return null
+    return {
+      candidateId, decision: 'approved', bundleDigest: publication.bundleDigest,
+      decidedAt: publication.publishedAt ?? new Date(0).toISOString(), actor: 'panel', publicationId: publication.publicationId,
+    }
+  }
+  /** Every decided candidate, newest first: the reviewer's history, including rejected bodies. */
+  decisions(): OwnerDecisionView[] {
+    const directory = join(this.root, 'candidates')
+    if (!existsSync(directory)) return []
+    const result: OwnerDecisionView[] = []
+    for (const name of readdirSync(directory)) {
+      try { if (lstatSync(join(directory, name)).isSymbolicLink()) continue } catch { continue }
+      let candidate: OwnerCandidate
+      try { candidate = this.candidate(name) } catch { continue }
+      const decision = this.decision(candidate.candidateId)
+      if (!decision) continue
+      const publication = this.publicationFor(candidate.candidateId)
+      result.push({
+        candidateId: candidate.candidateId, skillId: candidate.skillId, subjectId: candidate.subjectId,
+        ticketId: candidate.ticketId, decision: decision.decision, decidedAt: decision.decidedAt,
+        bundleDigest: candidate.bundleDigest,
+        publication: publication ? { publicationId: publication.publicationId, version: publication.version } : null,
+      })
+    }
+    return result.sort((a, b) => b.decidedAt.localeCompare(a.decidedAt)).slice(0, 200)
+  }
+  /** The live version's immediate predecessor, the only safe rollback target offered by the panel. */
+  previousPublication(skillId: string): OwnerPublication | null {
+    const database = this.database(), live = database.live[skillId]
+    if (!live) return null
+    return Object.values(database.publications)
+      .filter(item => item.skillId === skillId && item.version < live.version)
+      .sort((a, b) => b.version - a.version)[0] ?? null
   }
   /**
    * Record one human review outcome. `confirm: true` and the reviewed bundle
@@ -176,9 +249,13 @@ export class SkillOwner {
       try { candidate = this.candidate(name) } catch { continue }
       if (this.decision(candidate.candidateId)) continue
       result.push({
-        candidateId: candidate.candidateId, skillId: candidate.skillId, bundleDigest: candidate.bundleDigest,
+        candidateId: candidate.candidateId, skillId: candidate.skillId, subjectId: candidate.subjectId,
+        ticketId: candidate.ticketId, evidenceRefs: this.compactRefs(candidate.evidenceRefs),
+        bundleDigest: candidate.bundleDigest,
         baselineDigest: candidate.baselineDigest, description: candidate.entry.description ?? '',
         files: Object.keys(candidate.entry.files ?? {}), content: candidate.entry.content, stagedAt: candidate.stagedAt,
+        bundle: Object.entries(bundleFiles(candidate.skillId, candidate.entry)).map(([file, content]) => ({ name: file, content })),
+        baselineBundle: candidate.baselineDigest ? this.bundleAt(candidate.baselineDigest) : null,
       })
     }
     return result.sort((a, b) => a.stagedAt.localeCompare(b.stagedAt))
@@ -216,9 +293,44 @@ export class SkillOwner {
     return this.stageCandidate({ ...input, entry: structuredClone(source.entry) })
   }
   /**
-   * Commit an approved candidate. Publication authority is the recorded human
-   * decision bound to this exact bundle digest, plus the baseline CAS check;
-   * there is no validation runner and no Ticket requirement on this path.
+   * Commit one approved candidate: baseline CAS, immutable version directory,
+   * publication row and live pointer in one atomic state replacement. The caller
+   * holds the write lock and has already established publication authority.
+   */
+  private commit(candidate: OwnerCandidate, input: { idempotencyKey: string; subjectId: string; decisionDigest: string; publicationId: string; publishedAt: string }): OwnerPublication {
+    if (candidate.subjectId !== input.subjectId || !input.idempotencyKey) fail('Publication identity mismatch')
+    const database = this.database(), key = assetDigest(input.idempotencyKey)
+    const priorId = database.keys[key]
+    if (priorId) {
+      const prior = database.publications[priorId]!
+      // The key names one candidate; a rebuilt receipt may carry a different digest.
+      if (prior.candidateId !== candidate.candidateId) fail('Publication idempotency conflict')
+      return prior
+    }
+    if (Object.values(database.publications).some(item => item.candidateId === candidate.candidateId)) fail('This approval was already used for another publication')
+    const live = database.live, previous = live[candidate.skillId]
+    if ((previous?.bundleDigest ?? null) !== candidate.baselineDigest) fail('Skill baseline conflict')
+    if (this.skillsDir && existsSync(join(this.skillsDir, candidate.skillId, 'SKILL.md')) && !isHarnessOwnedBundle(readFileSync(join(this.skillsDir, candidate.skillId, 'SKILL.md'), 'utf8'))) fail('A user-owned skill now occupies this name')
+    const versionDir = join(this.root, 'versions', candidate.bundleDigest)
+    if (!existsSync(versionDir)) writeBundle(versionDir, readBundle(this.bundleDir(candidate.candidateId)))
+    if (assetDigest(readBundle(versionDir)) !== candidate.bundleDigest) fail('Immutable version digest mismatch')
+    const publication: OwnerPublication = {
+      skillId: candidate.skillId, publicationId: input.publicationId, version: (previous?.version ?? 0) + 1,
+      bundleDigest: candidate.bundleDigest, baselineDigest: candidate.baselineDigest, candidateId: candidate.candidateId,
+      decisionDigest: input.decisionDigest, idempotencyKey: input.idempotencyKey, publishedAt: input.publishedAt,
+      ...(candidate.rollbackOf ? { rollbackOf: candidate.rollbackOf } : {}),
+    }
+    // Decision reference, idempotency result and live pointer commit in one atomic database replacement.
+    database.publications[publication.publicationId] = publication
+    database.keys[key] = publication.publicationId; live[candidate.skillId] = publication
+    atomic(join(this.root, 'owner-state.json'), database)
+    this.invalidate(); return publication
+  }
+  /**
+   * Commit an approved candidate that already carries a decision receipt.
+   * Publication authority is that recorded decision bound to this exact bundle
+   * digest, plus the baseline CAS check; there is no validation runner and no
+   * Ticket requirement on this path.
    */
   publishCandidate(input: { candidateId: string; idempotencyKey: string; subjectId: string }): OwnerPublication {
     const candidate = this.candidate(input.candidateId)
@@ -228,27 +340,58 @@ export class SkillOwner {
     const decisionDigest = assetDigest(decision)
     if (decision.bundleDigest !== candidate.bundleDigest) fail('Approved digest does not match this candidate')
     return this.locked(() => {
-      const database = this.database(), key = assetDigest(input.idempotencyKey)
-      const priorId = database.keys[key]
-      if (priorId) {
-        const prior = database.publications[priorId]!
-        if (prior.candidateId !== input.candidateId || prior.decisionDigest !== decisionDigest) fail('Publication idempotency conflict')
-        return prior
-      }
       this.candidate(candidate.candidateId)
-      if (Object.values(database.publications).some(item => item.decisionDigest === decisionDigest)) fail('This approval was already used for another publication')
-      const live = database.live, previous = live[candidate.skillId]
-      if ((previous?.bundleDigest ?? null) !== candidate.baselineDigest) fail('Skill baseline conflict')
-      if (this.skillsDir && existsSync(join(this.skillsDir, candidate.skillId, 'SKILL.md')) && !isHarnessOwnedBundle(readFileSync(join(this.skillsDir, candidate.skillId, 'SKILL.md'), 'utf8'))) fail('A user-owned skill now occupies this name')
-      const versionDir = join(this.root, 'versions', candidate.bundleDigest)
-      if (!existsSync(versionDir)) writeBundle(versionDir, readBundle(this.bundleDir(candidate.candidateId)))
-      if (assetDigest(readBundle(versionDir)) !== candidate.bundleDigest) fail('Immutable version digest mismatch')
-      const publication: OwnerPublication = { skillId: candidate.skillId, publicationId: randomUUID(), version: (previous?.version ?? 0) + 1, bundleDigest: candidate.bundleDigest, baselineDigest: candidate.baselineDigest, candidateId: candidate.candidateId, decisionDigest, idempotencyKey: input.idempotencyKey, ...(candidate.rollbackOf ? { rollbackOf: candidate.rollbackOf } : {}) }
-      // Decision reference, idempotency result and live pointer commit in one atomic database replacement.
-      database.publications[publication.publicationId] = publication
-      database.keys[key] = publication.publicationId; live[candidate.skillId] = publication
-      atomic(join(this.root, 'owner-state.json'), database)
-      this.invalidate(); return publication
+      return this.commit(candidate, { idempotencyKey: input.idempotencyKey, subjectId: input.subjectId, decisionDigest, publicationId: randomUUID(), publishedAt: new Date().toISOString() })
+    })
+  }
+  /**
+   * One human click: approve-and-publish, or reject. On approval the publication
+   * state commits first and the decision receipt is written afterwards, so a
+   * failed publication records nothing and the candidate stays pending. A missing
+   * receipt is rebuilt from the publication, which is authoritative.
+   */
+  decideAndPublish(input: {
+    candidateId: string; decision: DecisionKind; confirm: boolean; expectedBundleDigest: string
+    idempotencyKey: string; subjectId: string
+  }): { decision: OwnerDecision; publication: OwnerPublication | null } {
+    if (input.decision !== 'approved' && input.decision !== 'rejected') fail('Decision must be approved or rejected')
+    if (input.confirm !== true) fail('An explicit human confirmation is required')
+    return this.locked(() => {
+      const candidate = this.candidate(input.candidateId)
+      if (input.expectedBundleDigest !== candidate.bundleDigest) fail('Reviewed digest does not match the staged candidate')
+      if (candidate.subjectId !== input.subjectId || !input.idempotencyKey) fail('Publication identity mismatch')
+      const existing = this.decision(candidate.candidateId)
+      if (existing) {
+        if (existing.decision !== input.decision) fail('Candidate already decided; a new candidate is required')
+        const publication = this.publicationFor(candidate.candidateId)
+        if (publication || existing.decision === 'rejected') return { decision: existing, publication }
+        // A legacy approval without a publication: the same click retries the commit.
+        const retried = this.commit(candidate, {
+          idempotencyKey: input.idempotencyKey, subjectId: input.subjectId,
+          decisionDigest: assetDigest(existing), publicationId: randomUUID(), publishedAt: new Date().toISOString(),
+        })
+        return { decision: existing, publication: retried }
+      }
+      if (input.decision === 'rejected') {
+        const decision: OwnerDecision = { candidateId: candidate.candidateId, decision: 'rejected', bundleDigest: candidate.bundleDigest, decidedAt: new Date().toISOString(), actor: 'panel' }
+        immutable(this.decisionFile(candidate.candidateId), decision)
+        return { decision, publication: null }
+      }
+      const prior = this.publicationFor(candidate.candidateId)
+      if (prior) {
+        // Crash between the state write and the receipt: complete the receipt, never publish twice.
+        const decision: OwnerDecision = {
+          candidateId: candidate.candidateId, decision: 'approved', bundleDigest: candidate.bundleDigest,
+          decidedAt: prior.publishedAt ?? new Date().toISOString(), actor: 'panel', publicationId: prior.publicationId,
+        }
+        try { immutable(this.decisionFile(candidate.candidateId), decision) } catch { /* a receipt already exists */ }
+        return { decision: this.decision(candidate.candidateId) ?? decision, publication: prior }
+      }
+      const publicationId = randomUUID(), decidedAt = new Date().toISOString()
+      const decision: OwnerDecision = { candidateId: candidate.candidateId, decision: 'approved', bundleDigest: candidate.bundleDigest, decidedAt, actor: 'panel', publicationId }
+      const publication = this.commit(candidate, { idempotencyKey: input.idempotencyKey, subjectId: input.subjectId, decisionDigest: assetDigest(decision), publicationId, publishedAt: decidedAt })
+      try { if (!existsSync(this.decisionFile(candidate.candidateId))) immutable(this.decisionFile(candidate.candidateId), decision) } catch { /* the publication is the authority */ }
+      return { decision: this.decision(candidate.candidateId) ?? decision, publication }
     })
   }
   status(query: { candidateId?: string; publicationId?: string; idempotencyKey?: string }): unknown {

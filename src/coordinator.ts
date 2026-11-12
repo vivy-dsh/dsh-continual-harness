@@ -380,6 +380,10 @@ export function createRefineCoordinator(options: RefineCoordinatorOptions): Refi
       if (request.signal?.aborted) return errorResult('planning', 'aborted', 'refinement request aborted')
       if (proposal.edits.length === 0) return emptyResult()
 
+      // Dead in production: `requireGlobalApprovalForTool` has no setter (index.ts
+      // never passes it) and `skillOwner` is always present in the plugin, so this
+      // gate never fires. Kept for the coordinator tests; the evolution panel no
+      // longer advertises a switch for it.
       const requiresApproval = !options.skillOwner && request.scope === 'global' && request.source === 'tool' && options.requireGlobalApprovalForTool === true
       let approval: RefineExecutionResult['approval'] = 'not-required'
       if (requiresApproval) {
